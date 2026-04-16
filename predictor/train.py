@@ -3,6 +3,7 @@ Train predictor model(s) on synthetic burst data.
 Saves checkpoints to ../models/{name}_predictor.pt
 """
 
+import copy
 import torch
 import torch.nn as nn
 import numpy as np
@@ -14,14 +15,25 @@ from data import generate_series
 
 MODEL_DIR  = Path(__file__).parent.parent / "models"
 K          = 30
-N_SERIES   = 150   # was 100
-EPOCHS     = 40    # was 30
+N_SERIES   = 150
 BATCH_SIZE = 256
 LR         = 0.001
 
+# time-based training — same wall-clock budget for every architecture
+# (TCN/DLinear complete far more epochs than LSTM/GRU in equal time)
+TIME_BUDGET     = 150
+CHECKPOINT_SECS = [30, 60, 120, 150]
+
+# early stopping — checked every ES_INTERVAL seconds, triggers after
+# PATIENCE consecutive checks with no improvement > MIN_DELTA
+ES_INTERVAL = 5.0
+ES_PATIENCE = 5
+ES_MIN_DELTA = 1e-4
+
+# was: EPOCHS = 40 (fixed, unfair across architectures)
+
 
 # original single-shape generator — replaced by generate_series() from data.py
-# which covers 7 shape types (wall, plateau, cliff, double_peak, sawtooth, ramp, noise)
 #
 # def generate_burst_series(n=300, baseline=100, burst_mult=8, burst_dur=30, noise=10):
 #     series = []
@@ -42,32 +54,25 @@ LR         = 0.001
 
 
 def windows_from_series(values, k):
-    """
-    Build (X, Y) pairs from a single series using per-window normalisation —
-    matching exactly what predictor_server.py does at inference time.
-
-    Each window is normalised with its own mean/std (not the full-series stats),
-    so no future values leak into any training sample.
-    """
     X, Y = [], []
     for j in range(k, len(values) - 1):
         window = values[j - k:j].astype(np.float32)
         mu  = window.mean()
-        std = window.std() + 1e-8
+        std = max(float(window.std()), mu * 0.05) + 1e-8
         X.append((window - mu) / std)
-        Y.append((values[j] - mu) / std)   # target normalised with same window stats
+        Y.append((values[j] - mu) / std)
     return X, Y
 
 
-def build_dataset(n_series, k, base_seed=42, train_ratio=0.8):
-    """
-    Split at the series level so no series appears in both train and test.
-    Previously the split was on the flattened window pool which would break
-    if n_series didn't divide evenly at the 80% boundary.
-    """
+def build_dataset(n_series, k, base_seed=42, train_ratio=0.7, val_ratio=0.15):
+    # three-way series-level split: 70% train / 15% val / 15% test
+    # val used for early stopping only — test never touched during training
+    # was: 80/20 train/test with early stopping on test set (leakage)
     n_train = int(n_series * train_ratio)
+    n_val   = int(n_series * val_ratio)
 
     all_X_tr, all_Y_tr = [], []
+    all_X_va, all_Y_va = [], []
     all_X_te, all_Y_te = [], []
 
     for i in range(n_series):
@@ -77,6 +82,8 @@ def build_dataset(n_series, k, base_seed=42, train_ratio=0.8):
         X_s, Y_s = windows_from_series(values, k)
         if i < n_train:
             all_X_tr.extend(X_s); all_Y_tr.extend(Y_s)
+        elif i < n_train + n_val:
+            all_X_va.extend(X_s); all_Y_va.extend(Y_s)
         else:
             all_X_te.extend(X_s); all_Y_te.extend(Y_s)
 
@@ -84,32 +91,9 @@ def build_dataset(n_series, k, base_seed=42, train_ratio=0.8):
         return (torch.FloatTensor(np.array(X)).unsqueeze(-1),
                 torch.FloatTensor(np.array(Y)).unsqueeze(-1))
 
-    return to_tensors(all_X_tr, all_Y_tr), to_tensors(all_X_te, all_Y_te)
-
-
-def train_model(model, X, Y):
-    optimizer = torch.optim.Adam(model.parameters(), lr=LR)
-    loss_fn   = nn.MSELoss()
-    model.train()
-    last_loss = 0.0
-
-    for epoch in range(EPOCHS):
-        perm = torch.randperm(len(X))
-        total, batches = 0.0, 0
-        for i in range(0, len(X), BATCH_SIZE):
-            idx  = perm[i:i + BATCH_SIZE]
-            pred = model(X[idx])
-            loss = loss_fn(pred, Y[idx])
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            total  += loss.item()
-            batches += 1
-        last_loss = total / batches
-        if (epoch + 1) % 10 == 0:
-            print(f"    epoch {epoch+1:3d}/{EPOCHS}  loss={last_loss:.6f}")
-
-    return last_loss
+    return (to_tensors(all_X_tr, all_Y_tr),
+            to_tensors(all_X_va, all_Y_va),
+            to_tensors(all_X_te, all_Y_te))
 
 
 def evaluate_model(model, X, Y):
@@ -117,12 +101,94 @@ def evaluate_model(model, X, Y):
     with torch.no_grad():
         preds  = model(X).squeeze(-1).numpy()
     actual = Y.squeeze(-1).numpy()
-    mae    = float(np.mean(np.abs(preds - actual)))
-    rmse   = float(np.sqrt(np.mean((preds - actual) ** 2)))
-    dir_acc = float(np.mean(
-        np.sign(np.diff(preds)) == np.sign(np.diff(actual))
-    )) * 100
+    mae     = float(np.mean(np.abs(preds - actual)))
+    rmse    = float(np.sqrt(np.mean((preds - actual) ** 2)))
+    # sign comparison in normalised space — was np.diff which compared
+    # direction between consecutive predictions (wrong)
+    dir_acc = float(np.mean(np.sign(preds) == np.sign(actual))) * 100
+    model.train()
     return mae, rmse, dir_acc
+
+
+def train_timed(model, X_tr, Y_tr, X_va, Y_va, X_te, Y_te):
+    optimizer = torch.optim.Adam(model.parameters(), lr=LR)
+    # Huber loss: quadratic for |error|<1, linear beyond — less blown up by
+    # large normalised targets at shape transitions (wall spikes etc.)
+    # was: nn.MSELoss()
+    loss_fn   = nn.HuberLoss(delta=1.0)
+
+    # checkpoints: {t_sec: (mae, rmse, dir_acc, early_stopped)}
+    checkpoints = {}
+    remaining   = list(CHECKPOINT_SECS)
+    epoch       = 0
+    t_start     = time.time()
+
+    # early stopping state
+    best_mae    = float("inf")
+    best_state  = copy.deepcopy(model.state_dict())
+    no_improve  = 0
+    last_es_t   = t_start
+    stopped_at  = None    # wall-seconds when ES triggered
+    stopped_m   = None    # (mae, rmse, dir_acc) at best restored state
+
+    while True:
+        elapsed = time.time() - t_start
+
+        # fill checkpoint slots that have passed
+        while remaining and elapsed >= remaining[0]:
+            t = remaining.pop(0)
+            if stopped_at is not None:
+                checkpoints[t] = (*stopped_m, True)
+                print(f"    @{t:>3}s  [early stop @{stopped_at:.0f}s]  "
+                      f"val_MAE={best_mae:.4f}  test_MAE={stopped_m[0]:.4f}  DirAcc={stopped_m[2]:.1f}%*")
+            else:
+                m_te = evaluate_model(model, X_te, Y_te)
+                m_va = evaluate_model(model, X_va, Y_va)
+                checkpoints[t] = (*m_te, False)
+                print(f"    @{t:>3}s  epoch={epoch:>4}  "
+                      f"val_MAE={m_va[0]:.4f}  test_MAE={m_te[0]:.4f}  DirAcc={m_te[2]:.1f}%")
+
+        if elapsed >= TIME_BUDGET or stopped_at is not None:
+            break
+
+        # early stopping on val set — test set never seen during training
+        if time.time() - last_es_t >= ES_INTERVAL:
+            last_es_t = time.time()
+            current_mae = evaluate_model(model, X_va, Y_va)[0]
+            if current_mae < best_mae - ES_MIN_DELTA:
+                best_mae   = current_mae
+                best_state = copy.deepcopy(model.state_dict())
+                no_improve = 0
+            else:
+                no_improve += 1
+                if no_improve >= ES_PATIENCE:
+                    model.load_state_dict(best_state)
+                    stopped_at = time.time() - t_start
+                    stopped_m  = evaluate_model(model, X_te, Y_te)
+                    print(f"    early stop at {stopped_at:.1f}s  "
+                          f"(best val_MAE={best_mae:.4f})")
+                    # fill all remaining checkpoints immediately
+                    for t in remaining:
+                        checkpoints[t] = (*stopped_m, True)
+                        print(f"    @{t:>3}s  [early stop @{stopped_at:.0f}s]  "
+                              f"val_MAE={best_mae:.4f}  test_MAE={stopped_m[0]:.4f}  DirAcc={stopped_m[2]:.1f}%*")
+                    remaining.clear()
+                    break
+
+        # one epoch
+        model.train()
+        perm = torch.randperm(len(X_tr))
+        for i in range(0, len(X_tr), BATCH_SIZE):
+            idx  = perm[i:i + BATCH_SIZE]
+            loss = loss_fn(model(X_tr[idx]), Y_tr[idx])
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+        epoch += 1
+
+    # always restore best val weights — not just on early stop
+    model.load_state_dict(best_state)
+    return checkpoints, epoch
 
 
 def main():
@@ -131,10 +197,11 @@ def main():
     np.random.seed(42)
 
     print(f"Building dataset: {N_SERIES} series × 300 steps, K={K} ...")
-    (X_tr, Y_tr), (X_te, Y_te) = build_dataset(N_SERIES, K)
-    print(f"Train: {len(X_tr):,}  |  Test: {len(X_te):,}\n")
+    (X_tr, Y_tr), (X_va, Y_va), (X_te, Y_te) = build_dataset(N_SERIES, K)
+    print(f"Train: {len(X_tr):,}  |  Val: {len(X_va):,}  |  Test: {len(X_te):,}")
+    print(f"Budget: {TIME_BUDGET}s/model  |  ES patience: {ES_PATIENCE}×{ES_INTERVAL}s\n")
 
-    results = {}
+    all_checkpoints = {}   # {name: {t: (mae, rmse, dir_acc, early_stopped)}}
 
     # original single-model block:
     # model     = LSTMPredictor()
@@ -155,28 +222,41 @@ def main():
     # torch.save(model.state_dict(), MODEL_DIR / "lstm_predictor.pt")
 
     for name, ModelClass in MODELS.items():
-        print(f"{'─'*50}\n  {name.upper()}")
-        model   = ModelClass()
-        t0      = time.time()
-        train_model(model, X_tr, Y_tr)
-        elapsed = time.time() - t0
-
-        mae, rmse, dir_acc = evaluate_model(model, X_te, Y_te)
-        results[name] = dict(mae=mae, rmse=rmse, dir_acc=dir_acc, secs=elapsed)
+        print(f"{'─'*52}\n  {name.upper()}")
+        model = ModelClass()
+        checkpoints, epochs_done = train_timed(model, X_tr, Y_tr, X_va, Y_va, X_te, Y_te)
+        all_checkpoints[name] = checkpoints
 
         save_path = MODEL_DIR / f"{name}_predictor.pt"
         torch.save(model.state_dict(), save_path)
-        print(f"  → {save_path.name}  MAE={mae:.4f}  DirAcc={dir_acc:.1f}%  ({elapsed:.1f}s)\n")
+        saved_val_mae, _, saved_val_dacc = evaluate_model(model, X_va, Y_va)
+        print(f"  → {save_path.name}  epochs={epochs_done}  "
+              f"saved val_MAE={saved_val_mae:.4f}  DirAcc={saved_val_dacc:.1f}%\n")
 
-    print(f"\n{'='*60}")
-    print(f"{'Model':<12} {'MAE':>8} {'RMSE':>8} {'DirAcc':>9} {'Secs':>7}")
-    print(f"{'─'*60}")
-    best = min(results, key=lambda n: results[n]["mae"])
-    for name, r in sorted(results.items(), key=lambda x: x[1]["mae"]):
-        star = " ★" if name == best else ""
-        print(f"{name:<12} {r['mae']:>8.4f} {r['rmse']:>8.4f}"
-              f" {r['dir_acc']:>8.1f}% {r['secs']:>6.1f}s{star}")
-    print(f"{'='*60}")
+    # ── Comparison table ──────────────────────────────────────────────────────
+    secs = CHECKPOINT_SECS
+    col  = 16
+
+    print(f"\n{'='*(12 + col * len(secs))}")
+    print(f"{'Model':<12}" +
+          "".join(f"@{s}s".center(col) for s in secs))
+    print(f"{'─'*(12 + col * len(secs))}")
+
+    for name in MODELS:
+        if name not in all_checkpoints:
+            continue
+        row = f"{name:<12}"
+        for s in secs:
+            if s not in all_checkpoints[name]:
+                row += "—".center(col)
+                continue
+            mae, _, da, es = all_checkpoints[name][s]
+            star = "*" if es else " "
+            row += f"{mae:.3f}/{da:.0f}%{star}".center(col)
+        print(row)
+
+    print(f"{'='*(12 + col * len(secs))}")
+    print("* = early stopping active, weights restored to best epoch\n")
 
 
 if __name__ == "__main__":

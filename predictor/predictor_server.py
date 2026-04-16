@@ -88,7 +88,8 @@ def main():
                     response = f"predicted_rate:100.0,confidence:0.0"
                 else:
                     h = np.array(history, dtype=np.float32)
-                    mu, std = h.mean(), h.std() + 1e-8
+                    mu  = h.mean()
+                    std = max(float(h.std()), mu * 0.05) + 1e-8
                     normed = (h - mu) / std
 
                     x = torch.FloatTensor(normed).unsqueeze(0).unsqueeze(-1)
