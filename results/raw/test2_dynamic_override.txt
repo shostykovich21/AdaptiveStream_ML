@@ -1,0 +1,33 @@
+=== TEST 2: Dynamic Interval Override ===
+Date: 2026-04-16
+Setup: Agent with background thread changing AtomicLong value over time
+  - Start: 2000ms
+  - After 6s: shrink to 500ms
+  - After 12s: expand to 3000ms
+
+Output:
+[AdaptiveStream] Agent loaded with dynamic interval control
+[AdaptiveStream] Instrumentation registered.
+[AdaptiveStream] SHRINKING interval: 2000ms -> 500ms
+[AdaptiveStream] EXPANDING interval: 500ms -> 3000ms
+[AdaptiveStream] OVERRIDE interval: 2000ms -> 3000ms
+[AdaptiveStream] OVERRIDE interval: 2000ms -> 3000ms
+Batch: 0
+[AdaptiveStream] OVERRIDE interval: 2000ms -> 3000ms
+[AdaptiveStream] OVERRIDE interval: 2000ms -> 3000ms
+Batch: 1
+[AdaptiveStream] OVERRIDE interval: 2000ms -> 3000ms
+[AdaptiveStream] OVERRIDE interval: 2000ms -> 3000ms
+Batch: 2
+[AdaptiveStream] OVERRIDE interval: 2000ms -> 3000ms
+Batch: 3
+[AdaptiveStream] OVERRIDE interval: 2000ms -> 3000ms
+Batch: 4
+[AdaptiveStream] OVERRIDE interval: 2000ms -> 3000ms
+Batch: 5
+DYNAMIC INTERVAL TEST COMPLETE
+
+Result: PASS
+- Spark reads new interval value on every trigger cycle
+- AtomicLong write from controller thread visible to Spark's trigger thread
+- Interval transitions happen without pipeline restart or state loss

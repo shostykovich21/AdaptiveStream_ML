@@ -1,0 +1,17 @@
+=== TEST 3: LSTM Inference Speed (CPU) ===
+Date: 2026-04-16
+Hardware: 2 cores, 3.8GB RAM (GCP e2-medium)
+Model: LSTM(input=1, hidden=64, layers=2), K=30 lookback
+PyTorch: 2.11.0+cpu
+
+LSTM Inference (CPU, 1000 runs):
+  Mean:   0.67 ms
+  Median: 0.64 ms
+  p95:    0.84 ms
+  p99:    1.03 ms
+  Max:    1.43 ms
+
+Result: PASS
+- Well under 50ms budget
+- Even p99 is ~1ms — negligible relative to any practical window interval (100ms+)
+- No GPU needed for inference

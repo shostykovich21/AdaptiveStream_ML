@@ -1,0 +1,34 @@
+=== TEST 4: Kafka -> Spark Structured Streaming ===
+Date: 2026-04-16
+Kafka: 3.7.0, Spark: 3.5.4
+
+Producer: sent 280 messages with burst pattern
+  - 80 normal (100 msg/s baseline)
+  - 200 burst (up to 800 msg/s)
+
+Spark batch read output:
+Total messages read from Kafka: 280
+
+Messages by phase:
++------+-----+
+| phase|count|
++------+-----+
+|normal|   80|
+| burst|  200|
++------+-----+
+
+Sample data:
++--------------------+-----+------+
+|                  ts|value| phase|
++--------------------+-----+------+
+|1.7763667591425936E9|    4|normal|
+|1.7763667592427974E9|   85|normal|
+|1.7763667593430462E9|   31|normal|
+| 1.776366759443281E9|   12|normal|
+|1.7763667595436783E9|   62|normal|
++--------------------+-----+------+
+
+Result: PASS
+- All 280 messages received
+- Phase labels (normal/burst) preserved through Kafka->Spark pipeline
+- JSON parsing with schema inference working

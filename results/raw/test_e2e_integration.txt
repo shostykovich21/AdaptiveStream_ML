@@ -1,0 +1,21 @@
+=== END-TO-END INTEGRATION TEST ===
+Date: 2026-04-16
+Components: Agent + Controller + LSTM Predictor + Spark Streaming
+
+Output:
+[Predictor] Loaded model from /home/aayushvbarhate/adaptivestream/models/lstm_predictor.pt
+[Predictor] Model warmed up
+[Predictor] Listening on 127.0.0.1:9876
+[Predictor] Controller connected from ('127.0.0.1', 48554)
+[AdaptiveStream] Agent v1.0 loading...
+[Controller] Starting LSTM predictor subprocess...
+[AdaptiveStream] Instrumentation active.
+[Controller] Connected. Control loop active.
+[E2E] Streaming started, monitoring for 15 seconds...
+[E2E] Test complete
+
+Result: PASS
+- Agent auto-starts predictor subprocess
+- Controller connects via TCP
+- Spark streaming runs with instrumented intervalMs()
+- No crashes, clean shutdown

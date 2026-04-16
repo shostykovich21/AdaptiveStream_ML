@@ -1,0 +1,31 @@
+=== TEST 1: ByteBuddy Agent Intercept ===
+Date: 2026-04-16
+Spark: 3.5.4, Java: 1.8.0_482, ByteBuddy: 1.14.12
+
+Command:
+  spark-submit --conf "spark.driver.extraJavaOptions=-javaagent:agent.jar" test_streaming.py
+
+Output:
+[AdaptiveStream] Agent loaded! Instrumenting ProcessingTimeExecutor...
+[AdaptiveStream] Instrumentation registered.
+[AdaptiveStream] INTERCEPTED: private long org.apache.spark.sql.execution.streaming.ProcessingTimeExecutor.intervalMs()
+[AdaptiveStream] INTERCEPTED: public void org.apache.spark.sql.execution.streaming.ProcessingTimeExecutor.execute(scala.Function0)
+[AdaptiveStream] INTERCEPTED: private long org.apache.spark.sql.execution.streaming.ProcessingTimeExecutor.intervalMs()
+[AdaptiveStream] INTERCEPTED: private long org.apache.spark.sql.execution.streaming.ProcessingTimeExecutor.intervalMs()
+[AdaptiveStream] INTERCEPTED: private long org.apache.spark.sql.execution.streaming.ProcessingTimeExecutor.intervalMs()
+[AdaptiveStream] INTERCEPTED: private long org.apache.spark.sql.execution.streaming.ProcessingTimeExecutor.intervalMs()
+Batch: 0
+[AdaptiveStream] INTERCEPTED: private long org.apache.spark.sql.execution.streaming.ProcessingTimeExecutor.intervalMs()
+[AdaptiveStream] INTERCEPTED: private long org.apache.spark.sql.execution.streaming.ProcessingTimeExecutor.intervalMs()
+[AdaptiveStream] INTERCEPTED: private long org.apache.spark.sql.execution.streaming.ProcessingTimeExecutor.intervalMs()
+Batch: 1
+[AdaptiveStream] INTERCEPTED: private long org.apache.spark.sql.execution.streaming.ProcessingTimeExecutor.intervalMs()
+[AdaptiveStream] INTERCEPTED: private long org.apache.spark.sql.execution.streaming.ProcessingTimeExecutor.intervalMs()
+Batch: 2
+STREAMING TEST COMPLETE
+
+Result: PASS
+- ProcessingTimeExecutor.class found in spark-sql_2.12-3.5.4.jar
+- intervalMs() intercepted on EVERY trigger cycle (not cached)
+- execute() also interceptable
+- Agent loads before any Spark class (premain)

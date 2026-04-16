@@ -1,0 +1,24 @@
+=== UNIT TESTS ===
+Date: 2026-04-16
+Framework: JUnit 4.13.2, Maven Surefire 3.2.5
+
+Tests run: 7, Failures: 0, Errors: 0 -- IntervalSmootherTest
+  - testFirstCallReturnsTarget
+  - testSmoothingPreventsJumps (2000->100 clamped to >=1000)
+  - testSmoothingPreventsSpikes (500->20000 clamped to <=1000)
+  - testGradualConvergence (converges to target over 20 iterations)
+  - testFloorEnforced (never below 100ms)
+  - testCeilingEnforced (never above 30000ms)
+  - testResetOverrides
+
+Tests run: 7, Failures: 0, Errors: 0 -- ControllerTest
+  - testHighRateGivesShortInterval (1000 evt/s -> <2s)
+  - testLowRateGivesLongInterval (10 evt/s -> >5s)
+  - testVeryHighRateClampedToMin (100000 evt/s -> 100ms)
+  - testZeroConfidenceReturnsFallback (-> 2000ms)
+  - testLowConfidenceBlendsTowardFallback
+  - testNegativeRateReturnsFallback
+  - testZeroRateReturnsFallback
+
+Total: 14 tests, 14 passed, 0 failures
+BUILD SUCCESS

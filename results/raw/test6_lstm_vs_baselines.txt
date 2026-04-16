@@ -1,0 +1,33 @@
+=== TEST 6: LSTM vs EMA vs SMA on Bursty Data ===
+Date: 2026-04-16
+Training: 100 synthetic burst series, 30 epochs, batch_size=256
+  - Per-series normalization (zero mean, unit std)
+  - 26,900 training samples
+  - Loss curve: 0.0065 -> 0.0045 over 30 epochs
+Evaluation: 20 fresh unseen test series
+
+=== ALL TRAFFIC [5380 samples] ===
+Method        MAE     Median      p95
+LSTM        13.33       9.86    36.85
+SMA        201.82     205.98   414.23
+EMA        121.35     118.75   248.84
+  LSTM beats EMA by 89.0%
+  LSTM beats SMA by 93.4%
+
+=== BURST ONLY (rate>200) [3771 samples] ===
+Method        MAE     Median      p95
+LSTM        10.86       8.88    27.75
+SMA        206.64     213.12   406.75
+EMA        131.19     140.66   246.02
+  LSTM beats EMA by 91.7%
+  LSTM beats SMA by 94.7%
+
+=== TRANSITIONS (rate changing >50/step) [2598 samples] ===
+Method        MAE     Median      p95
+LSTM        11.26       9.02    28.86
+SMA        307.63     341.47   422.90
+EMA        200.11     210.15   254.58
+  LSTM beats EMA by 94.4%
+  LSTM beats SMA by 96.3%
+
+Result: PASS — LSTM dominates across all traffic patterns

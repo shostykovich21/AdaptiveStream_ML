@@ -1,0 +1,15 @@
+=== TEST 5: Unix Socket IPC (Python LSTM <-> Controller) ===
+Date: 2026-04-16
+Setup: Python predictor server on localhost:9876, simulated controller client
+
+Cycle 1: sent 30 rates, predicted=0.03, inference=178.39ms, roundtrip=178.88ms
+Cycle 2: sent 30 rates, predicted=0.04, inference=1.56ms, roundtrip=1.86ms
+Cycle 3: sent 30 rates, predicted=0.03, inference=1.11ms, roundtrip=1.41ms
+Cycle 4: sent 30 rates, predicted=0.03, inference=0.9ms, roundtrip=1.15ms
+Cycle 5: sent 30 rates, predicted=0.03, inference=0.97ms, roundtrip=1.23ms
+
+Result: PASS
+- First call: ~178ms (PyTorch JIT warmup) — must pre-warm on startup
+- Subsequent calls: ~1ms inference, ~1.2ms roundtrip
+- Socket overhead: <0.3ms on top of inference
+- TCP on localhost is fine, Unix domain socket not needed
