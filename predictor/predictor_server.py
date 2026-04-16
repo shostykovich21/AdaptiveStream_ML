@@ -5,24 +5,12 @@ Collects real Spark streaming rates via REST API.
 """
 
 import socket
-import json
 import time
 import numpy as np
 import torch
-import torch.nn as nn
+from pathlib import Path
+from models import LSTMPredictor
 from metrics_collector import SparkMetricsCollector, DriverSideCollector
-
-
-class LSTMPredictor(nn.Module):
-    def __init__(self, input_size=1, hidden_size=64, num_layers=2, dropout=0.2):
-        super().__init__()
-        self.lstm = nn.LSTM(input_size, hidden_size, num_layers,
-                            batch_first=True, dropout=dropout)
-        self.fc = nn.Linear(hidden_size, 1)
-
-    def forward(self, x):
-        out, _ = self.lstm(x)
-        return self.fc(out[:, -1, :])
 
 
 def estimate_confidence(model, history_tensor, n_passes=10):
@@ -53,7 +41,7 @@ def main():
 
     # Load model
     model = LSTMPredictor()
-    model_path = "/home/aayushvbarhate/adaptivestream/models/lstm_predictor.pt"
+    model_path = Path(__file__).parent.parent / "models" / "lstm_predictor.pt"
     try:
         model.load_state_dict(torch.load(model_path, map_location="cpu", weights_only=True))
         print(f"[Predictor] Loaded model from {model_path}")
