@@ -7,17 +7,18 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 public class AdaptiveWindowController {
 
-    // Shared interval — Spark reads this on every trigger via IntervalAdvice
-    private static final AtomicLong currentIntervalMs = new AtomicLong(-1); // -1 = use default
+    private static final AtomicLong currentIntervalMs = new AtomicLong(-1);
     private static final AtomicBoolean fallbackMode = new AtomicBoolean(false);
+    private static final IntervalSmoother smoother = new IntervalSmoother();
 
-    // Config
-    private static final long UPDATE_PERIOD_MS = 1000;       // query LSTM every 1s
-    private static final long MIN_INTERVAL_MS = 100;          // floor
-    private static final long MAX_INTERVAL_MS = 30000;        // ceiling
-    private static final long FALLBACK_INTERVAL_MS = 2000;    // safe default on failure
+    // Tunable parameters
+    private static final long UPDATE_PERIOD_MS = 1000;
+    private static final long MIN_INTERVAL_MS = 100;
+    private static final long MAX_INTERVAL_MS = 30000;
+    private static final long FALLBACK_INTERVAL_MS = 2000;
     private static final int PREDICTOR_PORT = 9876;
     private static final int MAX_RECONNECT_ATTEMPTS = 5;
+    private static final long TARGET_EVENTS_PER_WINDOW = 1000;
 
     private static Process predictorProcess;
     private static Thread controllerThread;
@@ -36,7 +37,7 @@ public class AdaptiveWindowController {
                 System.out.println("[Controller] Starting LSTM predictor subprocess...");
                 try {
                     startPredictor();
-                    Thread.sleep(3000); // wait for predictor to warm up
+                    Thread.sleep(3000);
 
                     Socket socket = connectToPredictor();
                     if (socket == null) {
@@ -49,12 +50,11 @@ public class AdaptiveWindowController {
                     PrintWriter writer = new PrintWriter(
                         socket.getOutputStream(), true);
 
-                    System.out.println("[Controller] Connected to predictor. Control loop running.");
+                    System.out.println("[Controller] Connected. Control loop active.");
                     int consecutiveErrors = 0;
 
                     while (!Thread.interrupted()) {
                         try {
-                            // Send rate query
                             writer.println("predict");
                             String response = reader.readLine();
 
@@ -62,24 +62,30 @@ public class AdaptiveWindowController {
                                 throw new IOException("Predictor closed connection");
                             }
 
-                            // Parse response: "predicted_rate:450.5,confidence:0.92"
                             double predictedRate = parsePredictedRate(response);
                             double confidence = parseConfidence(response);
 
-                            // Compute interval from predicted rate
-                            long interval = computeInterval(predictedRate, confidence);
-                            currentIntervalMs.set(interval);
+                            long rawInterval = computeInterval(predictedRate, confidence);
+                            long smoothedInterval = smoother.smooth(rawInterval);
+
+                            currentIntervalMs.set(smoothedInterval);
                             fallbackMode.set(false);
                             consecutiveErrors = 0;
+
+                            if (Math.abs(rawInterval - smoothedInterval) > 100) {
+                                System.out.println("[Controller] Smoothed interval: "
+                                    + rawInterval + "ms -> " + smoothedInterval
+                                    + "ms (rate=" + String.format("%.0f", predictedRate)
+                                    + ", conf=" + String.format("%.2f", confidence) + ")");
+                            }
 
                         } catch (Exception e) {
                             consecutiveErrors++;
                             System.err.println("[Controller] Error: " + e.getMessage()
-                                + " (attempt " + consecutiveErrors + ")");
+                                + " (" + consecutiveErrors + "/3)");
 
                             if (consecutiveErrors >= 3) {
-                                enterFallback("Too many consecutive errors");
-                                // Try to restart predictor
+                                enterFallback("Too many errors, restarting predictor");
                                 restartPredictor();
                                 socket = connectToPredictor();
                                 if (socket != null) {
@@ -88,7 +94,7 @@ public class AdaptiveWindowController {
                                     writer = new PrintWriter(
                                         socket.getOutputStream(), true);
                                     consecutiveErrors = 0;
-                                    System.out.println("[Controller] Predictor restarted successfully.");
+                                    System.out.println("[Controller] Predictor recovered.");
                                 }
                             }
                         }
@@ -96,7 +102,7 @@ public class AdaptiveWindowController {
                         Thread.sleep(UPDATE_PERIOD_MS);
                     }
                 } catch (Exception e) {
-                    enterFallback("Controller thread crashed: " + e.getMessage());
+                    enterFallback("Controller crashed: " + e.getMessage());
                 }
             }
         }, "AdaptiveStream-Controller");
@@ -105,24 +111,39 @@ public class AdaptiveWindowController {
         controllerThread.start();
     }
 
-    private static long computeInterval(double predictedRate, double confidence) {
-        // High rate → short interval (process faster)
-        // Low rate → long interval (save overhead)
-        // Low confidence → conservative (use fallback interval)
-        if (confidence < 0.5) {
+    /**
+     * Compute target interval from predicted rate using adaptive formula.
+     *
+     * Core idea: target a fixed number of events per window (TARGET_EVENTS_PER_WINDOW).
+     *   interval = TARGET_EVENTS / predicted_rate
+     *
+     * Confidence scaling: low confidence → blend toward fallback interval.
+     *   effective_interval = confidence * computed + (1-confidence) * fallback
+     *
+     * This replaces the naive hardcoded heuristic with a principled approach:
+     * - High rate (burst): short interval → process faster, reduce latency
+     * - Low rate (quiet): long interval → fewer micro-batches, save overhead
+     * - Low confidence: conservative → use safe fallback interval
+     */
+    static long computeInterval(double predictedRate, double confidence) {
+        if (confidence < 0.1 || predictedRate <= 0) {
             return FALLBACK_INTERVAL_MS;
         }
 
-        // Target: process ~1000 events per window
-        long interval = (long)(1000.0 / Math.max(predictedRate, 1.0) * 1000);
+        // Target-based computation
+        double computedSec = TARGET_EVENTS_PER_WINDOW / Math.max(predictedRate, 1.0);
+        long computedMs = (long)(computedSec * 1000);
 
-        // Clamp to bounds
-        interval = Math.max(MIN_INTERVAL_MS, Math.min(interval, MAX_INTERVAL_MS));
-        return interval;
+        // Confidence-weighted blending with fallback
+        long blended = (long)(confidence * computedMs + (1.0 - confidence) * FALLBACK_INTERVAL_MS);
+
+        // Clamp to operational bounds
+        return Math.max(MIN_INTERVAL_MS, Math.min(blended, MAX_INTERVAL_MS));
     }
 
     private static void enterFallback(String reason) {
-        System.out.println("[Controller] FALLBACK MODE: " + reason);
+        System.out.println("[Controller] FALLBACK: " + reason);
+        smoother.reset(FALLBACK_INTERVAL_MS);
         currentIntervalMs.set(FALLBACK_INTERVAL_MS);
         fallbackMode.set(true);
     }
@@ -132,6 +153,22 @@ public class AdaptiveWindowController {
             "python3", "/home/aayushvbarhate/adaptivestream/predictor/predictor_server.py");
         pb.redirectErrorStream(true);
         predictorProcess = pb.start();
+
+        // Log predictor output in background
+        final InputStream is = predictorProcess.getInputStream();
+        Thread logThread = new Thread(new Runnable() {
+            public void run() {
+                try {
+                    BufferedReader r = new BufferedReader(new InputStreamReader(is));
+                    String line;
+                    while ((line = r.readLine()) != null) {
+                        System.out.println(line);
+                    }
+                } catch (Exception e) {}
+            }
+        }, "Predictor-Logger");
+        logThread.setDaemon(true);
+        logThread.start();
     }
 
     private static void restartPredictor() {
@@ -144,7 +181,7 @@ public class AdaptiveWindowController {
             startPredictor();
             Thread.sleep(3000);
         } catch (Exception e) {
-            System.err.println("[Controller] Failed to restart predictor: " + e.getMessage());
+            System.err.println("[Controller] Restart failed: " + e.getMessage());
         }
     }
 
@@ -153,6 +190,7 @@ public class AdaptiveWindowController {
             try {
                 return new Socket("127.0.0.1", PREDICTOR_PORT);
             } catch (Exception e) {
+                System.out.println("[Controller] Waiting for predictor... (" + (i+1) + ")");
                 try { Thread.sleep(1000); } catch (InterruptedException ie) { break; }
             }
         }
@@ -160,21 +198,24 @@ public class AdaptiveWindowController {
     }
 
     private static double parsePredictedRate(String response) {
-        // Format: "predicted_rate:450.5,confidence:0.92"
         try {
-            String[] parts = response.split(",");
-            return Double.parseDouble(parts[0].split(":")[1]);
-        } catch (Exception e) {
-            return 100.0; // safe default
-        }
+            for (String part : response.split(",")) {
+                if (part.startsWith("predicted_rate:")) {
+                    return Double.parseDouble(part.split(":")[1]);
+                }
+            }
+        } catch (Exception e) {}
+        return 100.0;
     }
 
     private static double parseConfidence(String response) {
         try {
-            String[] parts = response.split(",");
-            return Double.parseDouble(parts[1].split(":")[1]);
-        } catch (Exception e) {
-            return 0.0; // low confidence triggers fallback
-        }
+            for (String part : response.split(",")) {
+                if (part.startsWith("confidence:")) {
+                    return Double.parseDouble(part.split(":")[1]);
+                }
+            }
+        } catch (Exception e) {}
+        return 0.0;
     }
 }

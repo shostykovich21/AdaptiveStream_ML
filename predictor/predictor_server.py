@@ -1,109 +1,81 @@
 """
-AdaptiveStream LSTM Predictor Server
-Runs as subprocess, communicates with Java Controller via TCP socket.
-Handles: rate history collection, LSTM inference, confidence estimation.
+AdaptiveStream LSTM Predictor Server.
+Communicates with Java Controller via TCP.
+Collects real Spark streaming rates via REST API.
 """
 
 import socket
 import json
 import time
-import threading
 import numpy as np
 import torch
 import torch.nn as nn
-from collections import deque
+from metrics_collector import SparkMetricsCollector, DriverSideCollector
 
-# --- Model ---
+
 class LSTMPredictor(nn.Module):
-    def __init__(self, input_size=1, hidden_size=64, num_layers=2):
+    def __init__(self, input_size=1, hidden_size=64, num_layers=2, dropout=0.2):
         super().__init__()
-        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers,
+                            batch_first=True, dropout=dropout)
         self.fc = nn.Linear(hidden_size, 1)
 
     def forward(self, x):
         out, _ = self.lstm(x)
         return self.fc(out[:, -1, :])
 
-# --- Rate Collector (background thread) ---
-class RateCollector:
-    """Collects Kafka consumer rate from Spark metrics or direct observation."""
-    def __init__(self, window_size=30):
-        self.rates = deque(maxlen=window_size)
-        self.window_size = window_size
-        self._lock = threading.Lock()
 
-    def add_rate(self, rate):
-        with self._lock:
-            self.rates.append(rate)
-
-    def get_history(self):
-        with self._lock:
-            return list(self.rates)
-
-    def is_ready(self):
-        return len(self.rates) >= self.window_size
-
-# --- Confidence Estimator ---
-def estimate_confidence(model, history, n_forward=5):
+def estimate_confidence(model, history_tensor, n_passes=10):
     """
-    Monte Carlo dropout-style confidence.
-    Run multiple forward passes, measure prediction variance.
-    High variance = low confidence.
+    MC Dropout confidence estimation.
+    Model has dropout layers — run multiple forward passes in train mode,
+    measure variance. High variance = low confidence.
     """
-    model.train()  # enable dropout if present
+    model.train()  # enables dropout
     preds = []
-    x = torch.FloatTensor(history).unsqueeze(0).unsqueeze(-1)
-    for _ in range(n_forward):
+    for _ in range(n_passes):
         with torch.no_grad():
-            pred = model(x).item()
-            preds.append(pred)
+            p = model(history_tensor).item()
+            preds.append(p)
     model.eval()
 
-    variance = np.var(preds)
-    # Confidence: inverse of normalized variance
-    # Low variance = high confidence
-    confidence = 1.0 / (1.0 + variance * 100)
+    std = np.std(preds)
+    # Confidence inversely proportional to prediction spread
+    # Normalized so baseline noise gives ~0.8-0.9 confidence
+    confidence = 1.0 / (1.0 + std * 10)
     return float(np.clip(confidence, 0.0, 1.0))
 
-# --- Server ---
+
 def main():
     HOST = "127.0.0.1"
     PORT = 9876
-    K = 30  # lookback window
+    K = 30
 
-    # Load or initialize model
+    # Load model
     model = LSTMPredictor()
     model_path = "/home/aayushvbarhate/adaptivestream/models/lstm_predictor.pt"
     try:
-        model.load_state_dict(torch.load(model_path, map_location="cpu"))
+        model.load_state_dict(torch.load(model_path, map_location="cpu", weights_only=True))
         print(f"[Predictor] Loaded model from {model_path}")
-    except:
-        print("[Predictor] No saved model found, using untrained model")
+    except Exception as e:
+        print(f"[Predictor] No saved model ({e}), using untrained")
     model.eval()
 
-    # Warmup inference (avoid cold-start latency)
+    # Warmup — avoid cold start latency on first real prediction
     dummy = torch.randn(1, K, 1)
     for _ in range(10):
         with torch.no_grad():
             model(dummy)
-    print("[Predictor] Model warmed up")
+    print("[Predictor] Model warmed up (10 dummy inferences)")
 
-    # Rate collector
-    collector = RateCollector(window_size=K)
-
-    # Simulated rate feed (in production, reads from Spark metrics endpoint)
-    def rate_feed():
-        """Placeholder: in real system, scrapes Spark's StreamingQueryProgress"""
-        import random
-        while True:
-            # TODO: Replace with actual Spark metrics scraping
-            # For now, simulate rates for testing
-            rate = 100 + random.gauss(0, 20)
-            collector.add_rate(rate)
-            time.sleep(1)
-
-    feed_thread = threading.Thread(target=rate_feed, daemon=True)
-    feed_thread.start()
+    # Start metrics collector (polls Spark REST API)
+    collector = SparkMetricsCollector(
+        spark_ui_url="http://localhost:4040",
+        window_size=K,
+        poll_interval=1.0
+    )
+    collector.start()
+    print("[Predictor] Metrics collector started (polling Spark :4040)")
 
     # TCP server
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -125,44 +97,37 @@ def main():
                 history = collector.get_history()
 
                 if len(history) < K:
-                    # Not enough data yet
                     response = f"predicted_rate:100.0,confidence:0.0"
                 else:
-                    # Normalize
                     h = np.array(history, dtype=np.float32)
                     mu, std = h.mean(), h.std() + 1e-8
                     normed = (h - mu) / std
 
-                    # Predict
                     x = torch.FloatTensor(normed).unsqueeze(0).unsqueeze(-1)
-                    start = time.perf_counter()
                     with torch.no_grad():
                         pred_normed = model(x).item()
-                    inference_ms = (time.perf_counter() - start) * 1000
 
-                    # Denormalize
-                    predicted_rate = pred_normed * std + mu
-                    predicted_rate = max(predicted_rate, 0)
-
-                    # Confidence
-                    confidence = estimate_confidence(model, normed)
+                    predicted_rate = max(pred_normed * std + mu, 0)
+                    confidence = estimate_confidence(model, x)
 
                     response = f"predicted_rate:{predicted_rate:.2f},confidence:{confidence:.4f}"
 
                 conn.send((response + "\n").encode())
 
             elif data == "health":
-                conn.send(b"ok\n")
+                ready = "ready" if collector.is_ready() else "warming_up"
+                conn.send(f"ok,status:{ready},history_len:{len(collector.get_history())}\n".encode())
 
             elif data.startswith("rate:"):
-                # Manual rate injection (for testing)
+                # Manual rate injection (testing)
                 rate = float(data.split(":")[1])
-                collector.add_rate(rate)
+                collector.add_rate_manual(rate)
                 conn.send(b"ack\n")
 
     except Exception as e:
         print(f"[Predictor] Error: {e}")
     finally:
+        collector.stop()
         conn.close()
         server.close()
 
