@@ -1,0 +1,37 @@
+# Java
+target/
+*.class
+*.jar
+!agent/target/adaptivestream-agent-*.jar
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+*.egg-info/
+
+# PyTorch models (reproducible via train.py)
+models/*.pt
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Spark/Hadoop
+metastore_db/
+derby.log
+spark-warehouse/
+
+# Data (generated)
+*.csv
+!benchmark/results/.gitkeep
+
+# Logs
+*.log
+logs/
