@@ -22,32 +22,75 @@ spark-submit \
 
 ## How it works
 
+```mermaid
+flowchart TB
+    subgraph UserJob["Your Spark Job (unchanged)"]
+        SJ["Spark Structured Streaming<br/>reads intervalMs() every trigger cycle"]
+    end
+
+    subgraph Agent["JVM Agent — loaded via -javaagent flag"]
+        BI["ByteBuddy intercepts<br/>ProcessingTimeExecutor.intervalMs()"]
+        AL[("AtomicLong<br/>dynamic interval")]
+    end
+
+    subgraph Controller["Controller Thread (Java, daemon)"]
+        RP["Queries predictor every 1s"]
+        CI["Computes window interval<br/>from predicted rate"]
+        FB["Fallback: reverts to 2s<br/>on predictor failure"]
+    end
+
+    subgraph Predictor["LSTM Predictor (Python subprocess)"]
+        RC["Rate history buffer<br/>K=30 observations"]
+        LM["Trained LSTM model<br/>~0.7ms inference"]
+        CF["Returns: predicted_rate + confidence"]
+    end
+
+    K["Apache Kafka"] -->|"stream"| SJ
+    SJ -->|"calls intervalMs()"| BI
+    BI -->|"returns"| AL
+    CI -->|"writes"| AL
+    RP <-->|"TCP :9876"| CF
+    RP --> CI
+    RC --> LM --> CF
+    FB -.->|"safe default"| AL
+
+    style UserJob fill:#e8f5e9,stroke:#2e7d32
+    style Agent fill:#e3f2fd,stroke:#1565c0
+    style Controller fill:#fff3e0,stroke:#e65100
+    style Predictor fill:#fce4ec,stroke:#c62828
 ```
-                    ┌──────────────────────┐
-                    │  Your Spark Job       │
-                    │  (completely unchanged)│
-                    └──────────┬───────────┘
-                               │
-              ┌────────────────┴────────────────┐
-              │   JVM Agent (ByteBuddy)          │
-              │   intercepts intervalMs()         │
-              │   returns value from controller   │
-              └────────────────┬─────────���──────┘
-                               │
-              ┌────────────────┴────────────────┐
-              │   Controller Thread               │
-              │   reads predictions every 1s      │
-              │   computes interval from rate      │
-              │   writes to AtomicLong             │
-              │   handles failures → fallback mode │
-              └────────────────┬────────────────┘
-                               │ TCP (localhost:9876)
-              ┌────────────────┴────────────────┐
-              │   LSTM Predictor (Python)         │
-              │   collects rate history (K=30)     │
-              │   predicts next rate               │
-              │   returns rate + confidence score  │
-              └─────────────────────────────────┘
+
+```mermaid
+sequenceDiagram
+    participant K as Kafka
+    participant S as Spark Streaming
+    participant A as ByteBuddy Agent
+    participant C as Controller Thread
+    participant L as LSTM Predictor
+
+    Note over S: Job starts with -javaagent flag
+    A->>S: Instruments intervalMs() at classload
+    C->>L: Starts predictor subprocess
+    L-->>C: TCP connection established
+
+    loop Every trigger cycle
+        K->>S: Stream data
+        S->>A: Calls intervalMs()
+        A->>S: Returns dynamic interval from AtomicLong
+        S->>S: Processes micro-batch with adapted window
+    end
+
+    loop Every 1 second
+        C->>L: "predict" (TCP)
+        L->>L: LSTM inference (~0.7ms)
+        L-->>C: predicted_rate, confidence
+        C->>C: Compute interval from rate
+        C->>A: Update AtomicLong
+    end
+
+    Note over C,L: If predictor crashes:
+    C->>A: Fallback to 2s interval
+    C->>L: Restart subprocess
 ```
 
 ## Why LSTM and not just a moving average?
