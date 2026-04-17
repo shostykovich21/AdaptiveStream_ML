@@ -1,5 +1,20 @@
 # AdaptiveStream ML — Observed Results
 
+---
+
+## TODO / Planned Work
+
+| Priority | Item | Detail |
+|----------|------|--------|
+| HIGH | **Kafka lag as 2nd input feature** | Add `lag(t) = latestOffset - consumerOffset` alongside rate. Synthetic training: simulate producer-consumer dynamics. Changes input from `[K,1]` → `[K,2]`. Retrain all 9 models. See _Analysis: Kafka Lag Feature_ below. |
+| HIGH | **Real Spark validation** | Instrument a local Spark job (rate source or Docker Kafka) and collect 30–60 min of real `inputRowsPerSecond` + lag. That is the correct real-world benchmark — not Wikipedia. |
+| MED | **Extend synthetic dataset** | Add variable baseline scale (10–10k), diurnal sine shape, composite (slow trend + burst), more series (150→500). Needed before re-introducing Wikipedia evaluation. |
+| MED | **Extend LSTM/GRU budget** | Both were still improving at 150s. A 300s run would likely push LSTM below 0.38 val_MAE. |
+| LOW | **Wikipedia eval (deferred)** | Only meaningful once synthetic dataset covers slow-trend/diurnal patterns. See _Analysis: Why Wikipedia Failed_ below. |
+| LOW | **GPU training** | RTX 4060 available, currently all CPU. |
+
+---
+
 ## Training Run 1
 **Date:** 2026-04-17  
 **Hardware:** CPU only  
@@ -241,3 +256,102 @@ Wikipedia daily pageviews were tested (4 articles: FIFA World Cup, ChatGPT, Oppe
 - Wikipedia and GitHub Archive fetchers removed from `evaluate_stream.py`
 
 **Decision:** extend the synthetic dataset to cover variable-scale regimes and slower-timescale patterns before re-introducing real-world data evaluation.
+
+---
+
+## Analysis: Why Wikipedia Failed as a Benchmark
+
+EMA (alpha=0.7) beat every neural model on Wikipedia daily pageviews (75k vs 94k MAE). This looks damning but the reason has nothing to do with model quality:
+
+**1. Wrong temporal dynamics.**  
+Wikipedia daily views are slow-moving — day-to-day correlation is very high. EMA naturally exploits this: today ≈ yesterday. The neural models were trained on fast burst patterns completing in 10–30 steps. Wikipedia burst events (e.g. ChatGPT hype) unfold over weeks. The model has never seen that structure.
+
+**2. Wrong benchmark for this system.**  
+AdaptiveStream predicts Spark micro-batch rates (sub-second, events/second scale). Wikipedia daily pageviews share essentially no structure with that domain. EMA "winning" means the test is wrong, not the system.
+
+**3. The pooled MAE is meaningless.**  
+181 Wikipedia steps at ~90k MAE vs 6,210 synthetic steps at ~29 MAE. When pooled naively, Wikipedia completely drowns the synthetic signal. EMA appears to "win" overall because it wins on the larger-scale source.
+
+**4. Adding Kafka lag wouldn't fix this.**  
+Wikipedia is fetched from an HTTP API — there is no Kafka, no consumer, no lag. The lag feature would be 0 for all Wikipedia steps, giving the model exactly the same input it has now. Lag is not relevant to this benchmark.
+
+**Condition to re-introduce Wikipedia:** extend the synthetic dataset with slow-trend and diurnal shapes, retrain, then compare. Only then does Wikipedia tell you something meaningful about generalisation.
+
+---
+
+## Analysis: Training Data Diversity Ceiling
+
+The current synthetic dataset covers 7 shapes at ~100 events/s scale. The model can theoretically generalise to any domain — but only if the normalised pattern is in-distribution. With 7 synthetic shapes, the ceiling is low.
+
+### Three concrete options to raise it
+
+**Option 1 — Diverse real time series datasets (Monash Repository)**  
+The [Monash Time Series Repository](https://forecastingdata.org/) has ~58 datasets covering traffic, energy, weather, finance, web, and IoT — all real-world, all different dynamics. Training on normalised windows from these would cover far more shape variety than 7 synthetic shapes. No LLMs needed, datasets are public.
+
+**Option 2 — Amazon Chronos (time series foundation model)**  
+[Chronos](https://github.com/amazon-science/chronos-forecasting) is a pre-trained transformer from Amazon trained on a massive corpus of real-world time series. Critically, it can *generate* synthetic time series samples. Pipeline:
+1. Sample thousands of diverse windows from Chronos
+2. Use them as additional training data for the predictor  
+This gives real-world shape diversity without collecting your own data.
+
+**Option 3 — LLM-guided parameter generation**  
+Prompt an LLM to describe 100 diverse streaming scenarios ("IoT sensor with daily cycle and occasional dropout", "API endpoint with office-hours traffic and weekend flatline") and generate parameters for a richer shape simulator. More automatable than Option 1 but less principled than Option 2.
+
+### Recommendation
+Option 1 or 2 would get the model meaningfully closer to the generalisation ceiling. Option 3 is a quick intermediate step. All three are compatible with the existing normalised-window training pipeline.
+
+---
+
+## Analysis: Kafka Lag as a 2nd Input Feature
+
+### Why the current approach has a distribution shift problem
+
+The models are trained on synthetic data at ~100 events/s and deployed on unknown real Spark workloads. No amount of synthetic data improvement fully closes this gap because the distributional shift is in the workload structure, not the shape vocabulary.
+
+How industry actually handles it: most production adaptive streaming systems (Flink, Kafka consumer auto-scaling) do not use offline-trained ML models. They use reactive control loops with leading indicators — signals that are causally upstream of the rate rather than lagging behind it.
+
+### Kafka consumer lag as a leading indicator
+
+`inputRowsPerSecond` is a lagging signal — it tells you what Spark just processed. Consumer lag is a present-state signal:
+
+```
+lag(t) = latestOffset(t) - consumerOffset(t)
+```
+
+Both values are available at time t before the next batch starts. Lag tells you whether the system is currently falling behind, regardless of the workload domain. It is a universal pressure signal.
+
+- Lag growing → producer faster than consumer → next batch will be larger → shorten interval
+- Lag = 0 → system caught up → next rate depends purely on producer dynamics
+
+A model trained on (rate, lag) pairs generalises across Spark deployments because lag carries causal information that transcends the specific workload distribution.
+
+### No data leakage
+
+The input window at each step t:
+```
+[(rate(t-29), lag(t-29)), ..., (rate(t), lag(t))]  →  predict rate(t+1)
+```
+
+`lag(t)` is derived only from `rate(0)...rate(t)` — it encodes cumulative history, not future values. The target `rate(t+1)` is the label only, never a feature. Clean.
+
+The "unfair advantage" concern: lag is correlated with future rate through system dynamics — but that is precisely what makes it a good feature, not leakage. The same causal relationship holds in real deployment.
+
+### Synthetic training for lag
+
+Generate a producer-consumer simulation alongside each burst series:
+```
+capacity = baseline * capacity_ratio   # ~1.2x baseline
+lag(0)   = 0
+lag(t)   = max(0, lag(t-1) + (rate(t) - capacity))
+```
+
+Consumer capacity must be set so lag occasionally builds up during burst peaks — if capacity is too high, lag is always 0 and the model learns to ignore it in production too.
+
+### Implementation plan (pending)
+
+1. `data.py` — add `generate_series_with_lag()` returning `(values, lag, labels)`
+2. `models.py` — add `input_size` param to all architectures (default 2); change `[K,1]` → `[K,2]`
+3. `train.py` — build 2-feature dataset; normalise rate and lag independently
+4. `metrics_collector.py` — parse `sources[].latestOffset` and `sources[].endOffset` from Spark API; compute lag per partition, sum
+5. `predictor_server.py` — build `[K,2]` tensor; lag=0 fallback for non-Kafka sources
+6. `evaluate_stream.py` — simulate lag alongside rate in holdout evaluation
