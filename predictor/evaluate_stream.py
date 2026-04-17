@@ -1,5 +1,5 @@
 """
-Streaming evaluator — tests trained models against held-out and real-world data.
+Streaming evaluator — tests trained models against held-out synthetic data.
 
 Simulates production inference exactly:
   - K=30 sliding window deque (mirrors metrics_collector.py)
@@ -8,9 +8,13 @@ Simulates production inference exactly:
 
 Sources
 -------
-  1. Synthetic hold-out   — seeds 169-191 (train.py test split)
-  2. Wikipedia pageviews  — hourly rates, 4 articles with known burst events
-  3. GitHub Archive       — per-minute event counts (--github, downloads ~5 MB/hr)
+  1. Synthetic hold-out — seeds 169-191 (train.py test split, never touched during training)
+
+  Note: Wikipedia and GitHub Archive sources were tested but removed. The models are
+  trained on synthetic burst shapes at ~100 events/s scale; real-world data (Wikipedia
+  daily views in the hundreds of thousands) is out-of-distribution and produces
+  meaningless absolute MAE comparisons. Real-data evaluation will be re-added once
+  the synthetic dataset is extended to cover slower-timescale and variable-scale regimes.
 
 Entries in evaluation table
 ----------------------------
@@ -21,41 +25,19 @@ Entries in evaluation table
 Usage
 -----
     python evaluate_stream.py
-    python evaluate_stream.py --github
     python evaluate_stream.py --model lstm tcn
 """
 
 import argparse
-import gzip
-import json
 import time
 import numpy as np
-import requests
 import torch
-from collections import defaultdict, deque
-from io import BytesIO
+from collections import deque
 from pathlib import Path
 
 from models import MODELS
 from data import generate_series, shape_at_each_step
 from config import K, MODEL_DIR, VAL_SEEDS, HOLDOUT_SEEDS
-
-WIKI_ARTICLES = [
-    ("2022_FIFA_World_Cup",  "20221101", "20221231", "World Cup matches + final"),
-    ("ChatGPT",              "20221101", "20230228", "launch + hype peak"),
-    ("Oppenheimer_(film)",   "20230601", "20230930", "Barbenheimer release"),
-    ("2024_Summer_Olympics", "20240701", "20240831", "opening ceremony + events"),
-]
-WIKI_API = ("https://wikimedia.org/api/rest_v1/metrics/pageviews/per-article"
-            "/en.wikipedia/all-access/all-agents/{article}/hourly/{start}/{end}")
-
-GH_SLOTS = [
-    ("2024-01-15", 14),
-    ("2024-01-15", 20),
-    ("2024-01-16",  4),
-    ("2024-03-25", 14),
-]
-GH_URL = "https://data.gharchive.org/{date}-{hour}.json.gz"
 
 
 # ── Parametric baselines (no training, raw-space predictions) ─────────────────
@@ -324,106 +306,9 @@ class StreamingEvaluator:
                 print(row)
 
 
-# previously run() ran synthetic-only evaluation using arbitrary seeds 5000+
-# replaced by main() below which uses the actual held-out split and real sources
-#
-# def run(n_series=20, series_len=300, print_every=100, only=None):
-#     models = load_models(only)
-#     ev = StreamingEvaluator(models)
-#     total_steps = 0
-#     for series_idx in range(n_series):
-#         seed = 5000 + series_idx
-#         values, labels = generate_series(n=series_len, baseline=100,
-#                                          noise_std=10, seed=seed)
-#         shapes = shape_at_each_step(labels, series_len)
-#         ev.reset()
-#         for t in range(series_len - 1):
-#             preds = ev.step(values[t])
-#             ev.record(preds, actual_next=values[t + 1], shape=shapes[t])
-#             total_steps += 1
-#             if total_steps % print_every == 0:
-#                 stats = ev.rolling(window=print_every)
-#                 parts = [f"step {total_steps:6d}"]
-#                 for n, s in stats.items():
-#                     parts.append(f"{n}: MAE={s['mae']:5.1f} dir={s['dir_acc']:4.0f}%")
-#                 print("  |  ".join(parts))
-#     ev.print_final()
-
-
-# ── Data fetchers ─────────────────────────────────────────────────────────────
-
-def fetch_wikipedia(article, start, end):
-    url = WIKI_API.format(article=article, start=start, end=end)
-    try:
-        resp = requests.get(url, timeout=15,
-                            headers={"User-Agent": "AdaptiveStream-research/1.0"})
-        if resp.status_code != 200:
-            print(f"    [wiki] {article}: HTTP {resp.status_code}")
-            return None
-        views = np.array([it["views"] for it in resp.json().get("items", [])],
-                         dtype=np.float32)
-        # keep zeros — they are real observations (no traffic that hour)
-        # filtering them out compresses time and distorts burst structure
-        if len(views) < K + 5:
-            print(f"    [wiki] {article}: too few points ({len(views)})")
-            return None
-        return views
-    except Exception as e:
-        print(f"    [wiki] {article}: {e}")
-        return None
-
-
-def fetch_gh_hour(date, hour):
-    url = GH_URL.format(date=date, hour=hour)
-    try:
-        resp = requests.get(url, timeout=120, stream=True)
-        if resp.status_code != 200:
-            return None
-        buf = BytesIO()
-        for chunk in resp.iter_content(65536):
-            buf.write(chunk)
-        buf.seek(0)
-        counts = defaultdict(int)
-        with gzip.open(buf) as f:
-            for line in f:
-                try:
-                    ts = json.loads(line).get("created_at", "")
-                    if len(ts) >= 16:
-                        counts[int(ts[14:16])] += 1
-                except Exception:
-                    pass
-        result = [counts.get(m, 0) for m in range(60)]
-        print(f"    [gh] {date}-{hour:02d}h  {buf.tell()//1024:,} KB  "
-              f"events: {sum(result):,}")
-        return result
-    except Exception as e:
-        print(f"    [gh] {date}-{hour:02d}: {e}")
-        return None
-
-
-# ── Per-source runner ─────────────────────────────────────────────────────────
-
-def eval_source(models, streams, label, print_every=200):
-    ev    = StreamingEvaluator(models)
-    total = 0
-    for stream in streams:
-        ev.reset()
-        for t in range(len(stream) - 1):
-            preds = ev.step(stream[t])
-            ev.record(preds, actual_next=stream[t + 1], shape=label)
-            total += 1
-            if total % print_every == 0:
-                stats = ev.rolling(window=print_every)
-                parts = [f"  step {total:6d}"]
-                for n, s in stats.items():
-                    parts.append(f"{n}: MAE={s['mae']:5.1f} dir={s['dir_acc']:4.0f}%")
-                print("  |  ".join(parts))
-    return ev, total
-
-
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-def main(github=False, only=None):
+def main(only=None):
     print("Loading models...")
     neural_models = load_models(only)
     if not neural_models:
@@ -446,9 +331,7 @@ def main(github=False, only=None):
     print(f"\n  {len(neural_models)} neural  +  2 baselines  +  "
           f"{n_ensembles} ensembles  =  {len(models)} total entries\n")
 
-    results = {}
-
-    # ── 1. Synthetic hold-out ─────────────────────────────────────────────────
+    # ── Synthetic hold-out ────────────────────────────────────────────────────
     print(f"{'─'*60}")
     print("  Synthetic hold-out  (seeds 169–191, not seen during training)")
     streams, shape_maps = [], []
@@ -457,94 +340,22 @@ def main(github=False, only=None):
         streams.append(values)
         shape_maps.append(shape_at_each_step(labels, len(values)))
 
-    ev_syn = StreamingEvaluator(models)
-    total  = 0
+    ev = StreamingEvaluator(models)
+    total = 0
     for values, shapes in zip(streams, shape_maps):
-        ev_syn.reset()
+        ev.reset()
         for t in range(len(values) - 1):
-            preds = ev_syn.step(values[t])
+            preds = ev.step(values[t])
             # shapes[t+1]: tag by the regime the target value belongs to,
             # not the current regime — gives "error when predicting into shape X"
-            ev_syn.record(preds, actual_next=values[t + 1], shape=shapes[t + 1])
+            ev.record(preds, actual_next=values[t + 1], shape=shapes[t + 1])
             total += 1
     print(f"  {len(streams)} series  {total:,} steps")
-    ev_syn.print_results()
-    results["synthetic"] = ev_syn
-
-    # ── 2. Wikipedia pageviews ────────────────────────────────────────────────
-    print(f"\n{'─'*60}")
-    print("  Wikipedia hourly pageviews")
-    wiki_streams = []
-    for article, start, end, note in WIKI_ARTICLES:
-        print(f"  fetching {article}  ({note})")
-        arr = fetch_wikipedia(article, start, end)
-        if arr is not None:
-            wiki_streams.append(arr)
-            print(f"    → {len(arr)} points")
-        time.sleep(0.3)
-
-    if wiki_streams:
-        ev_wiki, total = eval_source(models, wiki_streams, "wikipedia")
-        print(f"  {len(wiki_streams)} articles  {total:,} steps")
-        ev_wiki.print_results()
-        results["wikipedia"] = ev_wiki
-    else:
-        print("  No data retrieved.")
-
-    # ── 3. GitHub Archive (opt-in) ────────────────────────────────────────────
-    if github:
-        print(f"\n{'─'*60}")
-        print("  GitHub Archive  (per-minute event counts)")
-        gh_minutes = []
-        for date, hour in GH_SLOTS:
-            counts = fetch_gh_hour(date, hour)
-            if counts:
-                gh_minutes.extend(counts)
-        if len(gh_minutes) >= K + 5:
-            arr = np.array(gh_minutes, dtype=np.float32)
-            ev_gh, total = eval_source(models, [arr], "github")
-            print(f"  {total:,} steps")
-            ev_gh.print_results()
-            results["github"] = ev_gh
-        else:
-            print("  Not enough data.")
-
-    # ── Aggregate table (models × sources) ───────────────────────────────────
-    if len(results) > 1:
-        sources = list(results.keys())
-        col     = 14
-        print(f"\n{'='*70}")
-        print("  AGGREGATE  (MAE — rows=models, cols=sources)")
-        print(f"  {'Model':<14}" +
-              "".join(f"{s[:col-2]:>{col}}" for s in sources) +
-              f"{'pooled':>{col}}")
-        print(f"  {'─'*( 14 + col * (len(sources) + 1))}")
-
-        pooled_all = {}
-        for n in models:
-            row = f"  {n:<14}"
-            all_errs = []
-            for src, ev in results.items():
-                errs = ev._abs_errors[n]
-                mae  = float(np.mean(errs)) if errs else float("inf")
-                row += f"{mae:>{col}.2f}"
-                all_errs.extend(errs)
-            pooled = float(np.mean(all_errs)) if all_errs else float("inf")
-            pooled_all[n] = pooled
-            row += f"{pooled:>{col}.2f}"
-            print(row)
-
-        print(f"  {'─'*(14 + col * (len(sources) + 1))}")
-        best = min(pooled_all, key=pooled_all.get)
-        print(f"  best: {best}  (pooled MAE={pooled_all[best]:.2f})")
-        print(f"{'='*70}\n")
+    ev.print_results()
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--github", action="store_true",
-                        help="also fetch GitHub Archive (~5 MB per hour)")
     parser.add_argument("--model", nargs="+", default=None)
     args = parser.parse_args()
-    main(github=args.github,
-         only=set(args.model) if args.model else None)
+    main(only=set(args.model) if args.model else None)

@@ -169,7 +169,75 @@ Recommendation: evaluate `ens_top3` and `ens_rnn` against individual models on r
 
 ### Next Steps
 
-- [ ] Run `evaluate_stream.py` — first look at test set MAE on holdout (seeds 169–191) + Wikipedia
-- [ ] Update ensemble composition: add `ens_top3`, drop DLinear/FITS from `ens_diverse`
+- [x] Run `evaluate_stream.py` — synthetic holdout complete (see Evaluation Run 1 below)
+- [x] Update ensemble composition: `ens_top3` added, TiDE replaces DLinear in `ens_diverse`
+- [ ] Extend synthetic dataset to cover variable-scale and slower-timescale regimes
 - [ ] Consider extending LSTM/GRU budget (both still improving at 150s)
 - [ ] GPU training — RTX 4060 available, currently all CPU
+
+---
+
+## Evaluation Run 1
+**Date:** 2026-04-17  
+**Script:** `evaluate_stream.py`  
+**Source:** Synthetic hold-out only (seeds 169–191, 23 series, 6,877 steps)
+
+### Results
+
+```
+Model               MAE     RMSE    DirAcc        n
+────────────────────────────────────────────────────
+ens_top3          28.49    81.36     72.4%    6,210 ★
+ens_rnn           28.53    82.27     72.7%    6,210
+lstm              28.64    82.82     72.2%    6,210
+gru               30.90    84.06     70.4%    6,210
+ens_diverse       31.27    85.91     71.5%    6,210
+tide              31.43    84.23     70.3%    6,210
+ens_wtd           32.23    86.00     71.9%    6,210
+ens_mean          33.49    87.63     71.7%    6,210
+mlp               35.55    90.56     68.6%    6,210
+tcn               35.99    98.99     70.8%    6,210
+nbeats            36.65    90.19     68.9%    6,210
+attn              38.23    98.94     67.3%    6,210
+dlinear           46.46   108.31     55.3%    6,210
+ema               55.30   112.87     44.6%    6,210
+fits              56.80   115.82     51.2%    6,210
+sma              151.00   205.69     52.8%    6,210
+```
+
+### Per-shape MAE (top-6 neural)
+
+```
+Shape               lstm       gru      tide       mlp       tcn    nbeats
+──────────────────────────────────────────────────────────────────────────
+cliff              54.38     52.64     52.61     57.15     54.78     62.53
+double_peak        24.18     24.23     26.89     26.34     26.22     29.19
+noise              13.59     15.68     16.10     18.56     18.90     19.53
+plateau            12.95     16.11     13.62     16.86     15.54     17.98
+ramp               28.40     30.08     32.05     35.20     34.08     34.89
+sawtooth           46.00     51.99     53.02     63.47     69.66     60.73
+wall               65.26     63.07     63.72     68.09     63.54     79.71
+```
+
+### Insights
+
+**1. Ensembles narrow but real gains over LSTM alone.**  
+`ens_top3` (28.49) and `ens_rnn` (28.53) both beat standalone LSTM (28.64). The margin is small but consistent. `ens_rnn` has slightly better DirAcc (72.7% vs 72.2%); `ens_top3` has slightly better MAE. Both are valid deployment candidates.
+
+**2. ens_wtd (32.23) is worse than standalone LSTM.**  
+Including FITS and DLinear — even at low weights — hurts. Confirmed: drop them from any ensemble used in production.
+
+**3. Abrupt transitions are the hardest regime.**  
+wall (65 MAE) and cliff (54 MAE) dominate errors across all models. These are step-function changes — the 30-step window history gives no warning. This is the primary gap in the synthetic dataset to address next.
+
+**4. EMA/SMA fail badly on bursty synthetic data.**  
+EMA MAE=55, SMA MAE=151 — both significantly worse than any neural model. These baselines are only competitive on slow-moving real-world data (Wikipedia etc.), not on the burst patterns the system is designed for.
+
+### Wikipedia evaluation (attempted, removed)
+
+Wikipedia daily pageviews were tested (4 articles: FIFA World Cup, ChatGPT, Oppenheimer, Paris Olympics). Results were not meaningful:
+- Models trained on ~100 events/s scale; Wikipedia peaks at 300k–1M daily views → incomparable absolute MAE
+- EMA "won" on Wikipedia because daily views are slow-moving (persistence works); this says nothing about burst prediction
+- Wikipedia and GitHub Archive fetchers removed from `evaluate_stream.py`
+
+**Decision:** extend the synthetic dataset to cover variable-scale regimes and slower-timescale patterns before re-introducing real-world data evaluation.
