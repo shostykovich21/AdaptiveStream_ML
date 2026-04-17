@@ -2,6 +2,212 @@
 
 ---
 
+## Branch Diff: `adaptivestream-ml` vs `AayushBarhate/AdaptiveStream:main`
+
+**12 files changed — 1741 insertions, 133 deletions**
+
+### File-level overview
+
+| File | Status | Summary |
+|------|--------|---------|
+| `agent/.../AdaptiveStreamAgent.java` | Modified | Minor comment fix |
+| `agent/.../AdaptiveWindowController.java` | Modified | Portable, model-agnostic subprocess launch |
+| `demo_spark_job.py` | **New** | End-to-end Spark streaming demo |
+| `predictor/config.py` | **New** | Shared constants — single source of truth |
+| `predictor/data.py` | **New** | 7-shape synthetic data generator with labels |
+| `predictor/evaluate_stream.py` | **New** | Full holdout evaluation: 9 models + 5 ensembles |
+| `predictor/metrics_collector.py` | Modified | Deduplication, app-name filter, zero-rate recording |
+| `predictor/models.py` | **New** | All 9 architectures + MODELS registry |
+| `predictor/predictor_server.py` | Modified | Model-agnostic, portable, safer cold-start |
+| `predictor/test_server.py` | **New** | TCP smoke-test client (no Spark/Java required) |
+| `predictor/train.py` | Modified | Time-budget training, early stopping, all 9 models |
+| `results.md` | **New** | Training logs, eval results, all analyses |
+
+---
+
+### 1. Synthetic Data Generator — `predictor/data.py` _(new file)_
+
+The original codebase had a single hardcoded burst shape inside `train.py`:
+```python
+# OLD (train.py): one shape, fixed params
+def generate_burst_series(n=300, baseline=100, burst_mult=8, burst_dur=30, noise=10):
+    ...  # ramp-up → hold → ramp-down, ~15% chance per segment
+```
+
+This was replaced with a standalone `data.py` module implementing **7 distinct shapes**:
+
+| Shape | Description | Segment length | Key property |
+|-------|-------------|----------------|--------------|
+| `noise` | Jittery baseline, no event | 10–50 steps | 25% base probability — fills gaps |
+| `ramp` | Gradual climb → hold → gradual drop | 15–45 steps | Original shape; now one of seven |
+| `wall` | Instant spike, slow linear recovery | 8–22 steps | Peak appears at t=0, no ramp-up warning |
+| `plateau` | Sustained elevated traffic, low noise | 20–60 steps | Level 2–6× baseline, σ=0.3× normal |
+| `cliff` | Elevated then sudden floor drop | 10–25 steps | Inverse of wall — drop is the hard part |
+| `double_peak` | Two bursts close together | 27–58 steps | Second peak 50–90% of first |
+| `sawtooth` | Repeated fast ramp → instant reset | 12–75 steps | 2–5 teeth, tests periodicity detection |
+
+Each call to `generate_series(seed)` returns:
+- `values`: `np.ndarray` of shape `(300,)` — the rate time series
+- `labels`: list of `(start_idx, end_idx, shape_name)` tuples — so the evaluator knows which shape is active at each timestep, enabling per-shape MAE breakdowns
+
+Shape probabilities are non-uniform: `noise=0.25`, `sawtooth=0.20`, `ramp=0.15`, rest `=0.10`.
+
+Peak amplitude is randomised per segment: `peak = baseline × Uniform(2, 10)`, giving 2×–10× burst height variability across training.
+
+---
+
+### 2. Model Architectures — `predictor/models.py` _(new file)_
+
+The original codebase had one model: `LSTMPredictor`, defined inline inside `predictor_server.py`. This branch adds **8 additional architectures** in a dedicated `models.py`, all sharing the same interface:
+
+```
+Input:  [batch, seq_len=30, 1]  — normalised rate history
+Output: [batch, 1]              — predicted next normalised rate
+```
+
+| Model | Class | Architecture | Parameters | Design rationale |
+|-------|-------|--------------|------------|-----------------|
+| `lstm` | `LSTMPredictor` | 2-layer LSTM, hidden=64, dropout=0.2 | ~50k | Baseline recurrent — was the only model in origin |
+| `gru` | `GRUPredictor` | 2-layer GRU, hidden=64, dropout=0.2 | ~38k | Ablation: does cell state add value over gating alone? |
+| `tcn` | `TCNPredictor` | Causal dilated Conv1D, dilations=[1,2,4,8], channels=32, kernel=3 | ~18k | Receptive field = 31 ≥ 30 ✓; causal padding (left-only) |
+| `dlinear` | `DLinear` | Trend+residual decomposition, 2 linear heads, kernel=5 | ~120 | "Are Transformers Effective?" (2022) baseline |
+| `mlp` | `MLPPredictor` | Flatten → 30→128→64→1, dropout=0.2 | ~12k | Ablation: is sequence modelling needed at K=30? |
+| `attn` | `AttnPredictor` | Self-attention, d_model=32, 4 heads, learned positional embedding | ~8k | Ablation: global context vs TCN local receptive field |
+| `tide` | `TiDEPredictor` | MLP encoder-decoder + linear residual skip, hidden=64, enc_depth=2 | ~10k | TiDE (2023) — pure dense, fast inference |
+| `fits` | `FITSPredictor` | FFT low-pass → complex linear projection → real output, cut_freq=10 | ~210 | FITS (ICLR 2024) — frequency domain, orthogonal approach |
+| `nbeats` | `NBEATSPredictor` | 3 FC blocks, each with backcast+forecast, hidden=64 | ~25k | N-BEATS (2019) — interpretable basis expansion |
+
+**TCN causal padding fix (important):** The original symmetric padding (`padding = dilation*(kernel-1)//2` on both sides) gave an effective receptive field of only ~16 steps at the last position because right-side zeros displaced left reach. Fixed to left-only padding: `ConstantPad1d((dilation*(kernel-1), 0), 0)` — RF now = 1+2+4+8+16 = 31 ≥ 30. ✓
+
+All 9 models are exposed through a `MODELS` registry dict so `train.py`, `predictor_server.py`, and `evaluate_stream.py` all use the same names with no duplication:
+```python
+MODELS = {"lstm": LSTMPredictor, "gru": GRUPredictor, "tcn": TCNPredictor, ...}
+```
+
+---
+
+### 3. Shared Config — `predictor/config.py` _(new file)_
+
+Extracted all magic numbers that must stay consistent across `train.py`, `evaluate_stream.py`, and `predictor_server.py`:
+
+| Constant | Value | Purpose |
+|----------|-------|---------|
+| `K` | `30` | Sliding window size — must match in train/serve/eval |
+| `N_SERIES` | `150` | Total synthetic series |
+| `BASE_SEED` | `42` | Seed of first series; series `i` gets `BASE_SEED + i` |
+| `TRAIN_RATIO` | `0.70` | → seeds 42–146 (105 series) |
+| `VAL_RATIO` | `0.15` | → seeds 147–168 (22 series) |
+| `HOLDOUT_SEEDS` | `range(169, 192)` | 23 series never touched during training |
+| `MODEL_DIR` | `../models/` | Where `.pt` checkpoints are written and read |
+
+Previously these were hardcoded independently in each script, causing silent inconsistencies (e.g. train used 100 series, evaluate expected a different split).
+
+---
+
+### 4. Training — `predictor/train.py` _(major rewrite)_
+
+| Aspect | Before | After |
+|--------|--------|-------|
+| **Scope** | LSTM only | All 9 models in sequence via `MODELS` registry |
+| **Data source** | Single inline `generate_burst_series()` — one shape | `generate_series()` from `data.py` — 7 shapes |
+| **Series count** | 100 train series, no val/test split | 105 train / 22 val / 23 test (never touched) |
+| **Training termination** | Fixed 30 epochs | 150s wall-clock budget per model — same compute for all architectures |
+| **Checkpoints** | None | Logged at 30s, 60s, 120s, 150s |
+| **Early stopping** | None | Patience=5 × 5s interval, `min_delta=1e-4` on val_MAE; best weights restored via `copy.deepcopy` |
+| **Loss function** | MSE | HuberLoss(delta=1.0) — less sensitive to burst outliers |
+| **Normalisation std floor** | `h.std() + 1e-8` | `max(h.std(), mu * 0.05) + 1e-8` — prevents collapse on flat plateau windows |
+| **Window off-by-one** | `range(k, len(values)-1)` — missed last prediction step | Fixed: `range(k, len(values))` |
+| **Hardcoded paths** | `sys.path.insert(0, "/home/aayushvbarhate/...")` | Uses `config.py` — no machine-specific paths |
+| **DirAcc definition** | `sign(pred) == sign(actual)` in normalised space — tests whether pred > window mean (easy, gave 88–89%) | `sign(pred − last) == sign(actual − last)` — up/down relative to current value (correct, gives 68–72%) |
+
+---
+
+### 5. Evaluation Script — `predictor/evaluate_stream.py` _(new file)_
+
+Did not exist in origin. Full streaming holdout evaluator:
+
+- **Simulates production inference exactly**: K=30 sliding deque, per-window normalisation, one observation at a time, no look-ahead
+- **16 entries evaluated**: 9 neural models + 2 baselines (SMA, EMA) + 5 ensembles
+- **EMA alpha tuning**: grid-searches `[0.1, 0.2, 0.3, 0.5, 0.7]` on val split before holdout evaluation
+- **Ensemble weighting**: `ens_wtd` weights by `1/val_MAE` computed on val split
+- **5 ensemble variants**:
+
+| Ensemble | Components | Purpose |
+|----------|------------|---------|
+| `ens_mean` | All 9 neural, equal weight | Lower bound — includes weak models |
+| `ens_wtd` | All 9 neural, weighted by 1/val_MAE | Penalises weak models but doesn't exclude them |
+| `ens_rnn` | LSTM + GRU | Pure recurrent family ensemble |
+| `ens_top3` | LSTM + GRU + TiDE | Best 3, diverse families — recommended |
+| `ens_diverse` | Best-RNN + TCN + TiDE + Attn | One from each architecture family |
+
+- **Per-shape MAE breakdown**: records shape label at each prediction step; reports MAE per shape for the top-6 neural models
+- **Shape tagging rule**: shapes labelled by the regime the *target* value belongs to — gives "error when predicting *into* shape X", not "error while *in* shape X"
+- **Wikipedia / GitHub Archive removed**: both real-data sources were tested but removed. Models trained at ~100 events/s; Wikipedia peaks at 300k–1M daily views — incomparable absolute MAE. EMA "winning" reflected the wrong benchmark, not a model deficiency.
+
+---
+
+### 6. Java Agent — `AdaptiveWindowController.java` _(modified)_
+
+| Change | Before | After |
+|--------|--------|-------|
+| Subprocess command | `new ProcessBuilder("python3", "/home/aayushvbarhate/adaptivestream/predictor/predictor_server.py")` — hardcoded absolute path to Aayush's machine | `new ProcessBuilder(PYTHON_EXEC, PREDICTOR_SCRIPT, "--model", PREDICTOR_MODEL)` |
+| Model selection | LSTM only, no way to change without recompiling | `-Dadaptivestream.predictor.model=lstm` (or `tcn`, `gru`, etc.) at spark-submit time |
+| Python executable | Hardcoded `python3` | `-Dadaptivestream.python=python3` system property |
+| Script path resolution | None — hardcoded | `detectPredictorScript()` with 4-level priority: system property → JAR-relative (`agent/target/` → up 2 → `predictor/`) → working dir → `ADAPTIVESTREAM_PREDICTOR` env var |
+| Startup log | `"Starting LSTM predictor subprocess..."` | `"Starting predictor subprocess (lstm) ..."` — model name shown |
+
+---
+
+### 7. Metrics Collector — `predictor/metrics_collector.py` _(modified)_
+
+| Change | Before | After |
+|--------|--------|-------|
+| App name filter | Always attached to first Spark app in the list | Optional `app_name` constructor param — if set, matches by `app["name"]` |
+| `recentProgress` deduplication | None — every poll re-counted all recent batches; rate inflated with duplicates | `max_batch_id` int tracker — skips any `batchId ≤ max_batch_id` |
+| `sql/streaming` deduplication | None — same query re-counted every poll cycle | `(runId, latestBatchId)` composite key in `seen_batch_keys` set |
+| Zero-rate recording | `if rate > 0: self._add_rate(rate)` — idle batches silently dropped | `self._add_rate(rate)` unconditionally — idle (0.0) is a real observation the model should see |
+
+---
+
+### 8. Predictor Server — `predictor/predictor_server.py` _(modified)_
+
+| Change | Before | After |
+|--------|--------|-------|
+| Model | `LSTMPredictor` class defined inline in this file | `--model` CLI arg; any key from `MODELS` registry accepted |
+| Model path | `/home/aayushvbarhate/adaptivestream/models/lstm_predictor.pt` | `MODEL_DIR / f"{args.model}_predictor.pt"` from `config.py` |
+| Missing `.pt` file | Silent: trained with random weights and served predictions | Hard exit: `raise SystemExit(1)` with clear error message |
+| Cold-start fallback | `predicted_rate:100.0` hardcoded — only valid for synthetic training scale | `mean(history)` if partial window; `0.0` if no history yet |
+| Normalisation std floor | `h.std() + 1e-8` | `max(h.std(), mu * 0.05) + 1e-8` |
+| Host/port | Hardcoded `127.0.0.1:9876` | `--host` / `--port` CLI args |
+| Spark URL | Hardcoded `http://localhost:4040` | `--spark-url` CLI arg |
+| Spark app filter | First available app | `--spark-app` forwarded to `SparkMetricsCollector` |
+| Imports | Defined `LSTMPredictor` here; imported `DriverSideCollector` (unused) | Imports from `models.py`, `config.py`; `DriverSideCollector` removed |
+
+---
+
+### 9. Demo Job — `demo_spark_job.py` _(new file)_
+
+End-to-end test harness for the agent. Runs a Spark Structured Streaming job using the built-in `rate` source:
+
+- **Rate schedule**: `(0s, 50) → (15s, 500) → (30s, 50) → (45s, 800) → (55s, 300) → (70s, 50) → (85s, 1200) → (95s, 50)` — covers wall bursts, partial drops, spikes
+- **Background thread**: `rate_changer()` logs the current target rate every 5s
+- **Runtime**: 120s then auto-stops (or Ctrl+C)
+- **Usage without agent**: fixed 1s trigger, static behaviour (baseline)
+- **Usage with agent**: `spark-submit --driver-java-options "-javaagent:/tmp/as-agent.jar -Dadaptivestream.predictor.model=lstm"` — agent intercepts `intervalMs()` and adapts the trigger
+
+---
+
+### 10. Test Client — `predictor/test_server.py` _(new file)_
+
+Smoke test for `predictor_server.py` with no Spark or Java required:
+
+- Starts the server as a subprocess (`--model` configurable)
+- Connects via TCP and exercises the full protocol: `health` → inject 30 rates via `rate:N` → `health` (assert `status:ready`) → `predict`
+- Validates response format, asserts `predicted_rate ≥ 0`, `0 ≤ confidence ≤ 1`
+- Exits 0 on PASS, 1 on FAIL — compatible with CI
+
+---
+
 ## TODO / Planned Work
 
 | Priority | Item | Detail |
