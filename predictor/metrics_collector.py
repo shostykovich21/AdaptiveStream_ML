@@ -38,9 +38,9 @@ class SparkMetricsCollector:
             self._thread.join(timeout=5)
 
     def _poll_loop(self):
-        app_id         = None
-        last_batch_id  = None   # dedupe for recentProgress path
-        last_run_ids   = set()  # dedupe for sql/streaming fallback path
+        app_id              = None
+        max_batch_id        = -1          # dedupe for recentProgress path
+        seen_batch_keys     = set()       # dedupe for sql/streaming fallback: (runId, latestBatchId)
         while self._running:
             try:
                 # Get active application ID
@@ -56,28 +56,35 @@ class SparkMetricsCollector:
 
                     if resp.status_code == 200:
                         data = resp.json()
-                        # recentProgress returns all recent batches on every poll —
-                        # track batchId to avoid appending the same batch twice
+                        # recentProgress returns ALL recent batches on every poll.
+                        # batch IDs are monotonically increasing, so skip anything
+                        # already seen by comparing against max_batch_id.
                         if "recentProgress" in data:
+                            new_max = max_batch_id
                             for progress in data["recentProgress"]:
                                 bid  = progress.get("batchId")
                                 rate = progress.get("inputRowsPerSecond", 0)
-                                if bid is None or bid == last_batch_id:
+                                if bid is None or bid <= max_batch_id:
                                     continue
-                                last_batch_id = bid
+                                new_max = max(new_max, bid)
                                 if rate > 0:
                                     self._add_rate(rate)
+                            max_batch_id = new_max
                     else:
-                        # Spark 3.x: try individual query endpoints
+                        # Spark 3.x: try individual query endpoints.
+                        # runId is a query-lifetime identifier — not a batch counter.
+                        # Use (runId, latestBatchId) as the composite key so we
+                        # collect one rate per batch, not one rate per query lifetime.
                         url = f"{self.spark_ui_url}/api/v1/applications/{app_id}/sql/streaming"
                         resp = requests.get(url, timeout=2)
                         if resp.status_code == 200:
-                            queries = resp.json()
-                            for q in queries:
-                                run_id = q.get("runId")
-                                if run_id is None or run_id in last_run_ids:
+                            for q in resp.json():
+                                run_id   = q.get("runId")
+                                batch_id = q.get("latestBatchId")
+                                key      = (run_id, batch_id)
+                                if run_id is None or batch_id is None or key in seen_batch_keys:
                                     continue
-                                last_run_ids.add(run_id)
+                                seen_batch_keys.add(key)
                                 rate = q.get("inputRowsPerSecond", 0)
                                 if rate > 0:
                                     self._add_rate(rate)

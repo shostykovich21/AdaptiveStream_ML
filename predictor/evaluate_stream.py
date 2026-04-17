@@ -8,7 +8,7 @@ Simulates production inference exactly:
 
 Sources
 -------
-  1. Synthetic hold-out   — seeds 170-191 (train.py test split)
+  1. Synthetic hold-out   — seeds 169-191 (train.py test split)
   2. Wikipedia pageviews  — hourly rates, 4 articles with known burst events
   3. GitHub Archive       — per-minute event counts (--github, downloads ~5 MB/hr)
 
@@ -449,7 +449,7 @@ def main(github=False, only=None):
 
     # ── 1. Synthetic hold-out ─────────────────────────────────────────────────
     print(f"{'─'*60}")
-    print("  Synthetic hold-out  (seeds 170–191, not seen during training)")
+    print("  Synthetic hold-out  (seeds 169–191, not seen during training)")
     streams, shape_maps = [], []
     for seed in HOLDOUT_SEEDS:
         values, labels = generate_series(n=300, baseline=100, noise_std=10, seed=seed)
