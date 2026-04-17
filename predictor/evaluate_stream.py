@@ -16,7 +16,7 @@ Entries in evaluation table
 ----------------------------
   Neural (9):    lstm, gru, tcn, dlinear, mlp, attn, tide, fits, nbeats
   Baselines (2): sma, ema  (no training, operate in raw rate space)
-  Ensembles (4): ens_mean, ens_wtd, ens_rnn, ens_diverse
+  Ensembles (5): ens_mean, ens_wtd, ens_rnn, ens_top3, ens_diverse
 
 Usage
 -----
@@ -198,13 +198,21 @@ def build_extended_models(neural_models, val_maes, ema_alpha):
     if len(rnn) >= 2:
         extended["ens_rnn"] = EnsemblePredictor(rnn)
 
-    # ens_diverse: one from each family — best RNN + tcn + dlinear + attn
+    # ens_top3: top-3 by val_MAE — lstm + gru + tide (best non-recurrent)
+    # diverse families, all validated as strong; recommended for deployment
+    top3_names = ("lstm", "gru", "tide")
+    top3 = {n: neural_models[n] for n in top3_names if n in neural_models}
+    if len(top3) >= 2:
+        extended["ens_top3"] = EnsemblePredictor(top3)
+
+    # ens_diverse: one from each family — best RNN + tcn + tide + attn
+    # (dlinear excluded: confirmed weak on non-linear burst shapes)
     best_rnn = min(
         [n for n in ("lstm", "gru") if n in neural_models],
         key=lambda n: val_maes.get(n, float("inf")),
         default=None,
     )
-    diverse_names = [best_rnn, "tcn", "dlinear", "attn"]
+    diverse_names = [best_rnn, "tcn", "tide", "attn"]
     diverse = {n: neural_models[n] for n in diverse_names
                if n is not None and n in neural_models}
     if len(diverse) >= 2:
@@ -434,8 +442,9 @@ def main(github=False, only=None):
 
     # build full model dict: neural + baselines + ensembles
     models = build_extended_models(neural_models, val_maes, ema_alpha)
+    n_ensembles = len(models) - len(neural_models) - 2
     print(f"\n  {len(neural_models)} neural  +  2 baselines  +  "
-          f"{len(models) - len(neural_models) - 2} ensembles  =  {len(models)} total entries\n")
+          f"{n_ensembles} ensembles  =  {len(models)} total entries\n")
 
     results = {}
 
