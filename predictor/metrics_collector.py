@@ -38,7 +38,9 @@ class SparkMetricsCollector:
             self._thread.join(timeout=5)
 
     def _poll_loop(self):
-        app_id = None
+        app_id         = None
+        last_batch_id  = None   # dedupe for recentProgress path
+        last_run_ids   = set()  # dedupe for sql/streaming fallback path
         while self._running:
             try:
                 # Get active application ID
@@ -54,10 +56,15 @@ class SparkMetricsCollector:
 
                     if resp.status_code == 200:
                         data = resp.json()
-                        # Extract inputRowsPerSecond from recent batches
+                        # recentProgress returns all recent batches on every poll —
+                        # track batchId to avoid appending the same batch twice
                         if "recentProgress" in data:
                             for progress in data["recentProgress"]:
+                                bid  = progress.get("batchId")
                                 rate = progress.get("inputRowsPerSecond", 0)
+                                if bid is None or bid == last_batch_id:
+                                    continue
+                                last_batch_id = bid
                                 if rate > 0:
                                     self._add_rate(rate)
                     else:
@@ -67,10 +74,13 @@ class SparkMetricsCollector:
                         if resp.status_code == 200:
                             queries = resp.json()
                             for q in queries:
-                                if "runId" in q:
-                                    rate = q.get("inputRowsPerSecond", 0)
-                                    if rate > 0:
-                                        self._add_rate(rate)
+                                run_id = q.get("runId")
+                                if run_id is None or run_id in last_run_ids:
+                                    continue
+                                last_run_ids.add(run_id)
+                                rate = q.get("inputRowsPerSecond", 0)
+                                if rate > 0:
+                                    self._add_rate(rate)
 
             except requests.exceptions.ConnectionError:
                 pass  # Spark UI not up yet, keep trying

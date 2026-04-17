@@ -43,9 +43,10 @@ K         = 30
 MODEL_DIR = Path(__file__).parent.parent / "models"
 
 # held-out series: train.py base_seed=42, 70/15/15 split
-# train: indices 0-104 (seeds 42-146), val: 105-127 (seeds 147-169), test: 128-149 (seeds 170-191)
-HOLDOUT_SEEDS = range(170, 192)
-VAL_SEEDS     = range(147, 170)   # used for EMA alpha tuning and ensemble weighting
+# n_train=105, n_val=int(150*0.15)=22, n_test=23
+# train: indices 0-104 (seeds 42-146), val: 105-126 (seeds 147-168), test: 127-149 (seeds 169-191)
+HOLDOUT_SEEDS = range(169, 192)
+VAL_SEEDS     = range(147, 169)   # used for EMA alpha tuning and ensemble weighting
 
 WIKI_ARTICLES = [
     ("2022_FIFA_World_Cup",  "20221101", "20221231", "World Cup matches + final"),
@@ -238,10 +239,9 @@ class StreamingEvaluator:
         self._shape_errs  = {n: {} for n in models}
 
     def reset(self):
+        # clears only the sliding window — accumulators persist across series
+        # so that print_results() reflects the full source, not just the last stream
         self.window.clear()
-        for n in self.models:
-            self._abs_errors[n].clear()
-            self._dir_correct[n].clear()
 
     def step(self, rate):
         self.window.append(float(rate))
@@ -362,7 +362,8 @@ def fetch_wikipedia(article, start, end):
             return None
         views = np.array([it["views"] for it in resp.json().get("items", [])],
                          dtype=np.float32)
-        views = views[views > 0]
+        # keep zeros — they are real observations (no traffic that hour)
+        # filtering them out compresses time and distorts burst structure
         if len(views) < K + 5:
             print(f"    [wiki] {article}: too few points ({len(views)})")
             return None
@@ -461,7 +462,9 @@ def main(github=False, only=None):
         ev_syn.reset()
         for t in range(len(values) - 1):
             preds = ev_syn.step(values[t])
-            ev_syn.record(preds, actual_next=values[t + 1], shape=shapes[t])
+            # shapes[t+1]: tag by the regime the target value belongs to,
+            # not the current regime — gives "error when predicting into shape X"
+            ev_syn.record(preds, actual_next=values[t + 1], shape=shapes[t + 1])
             total += 1
     print(f"  {len(streams)} series  {total:,} steps")
     ev_syn.print_results()

@@ -46,7 +46,9 @@ def main():
         model.load_state_dict(torch.load(model_path, map_location="cpu", weights_only=True))
         print(f"[Predictor] Loaded model from {model_path}")
     except Exception as e:
-        print(f"[Predictor] No saved model ({e}), using untrained")
+        print(f"[Predictor] FATAL: could not load model from {model_path}: {e}")
+        print("[Predictor] Refusing to serve with uninitialised weights — exiting.")
+        raise SystemExit(1)
     model.eval()
 
     # Warmup — avoid cold start latency on first real prediction

@@ -55,7 +55,7 @@ ES_MIN_DELTA = 1e-4
 
 def windows_from_series(values, k):
     X, Y = [], []
-    for j in range(k, len(values) - 1):
+    for j in range(k, len(values)):  # was: len(values)-1, missing the last prediction step
         window = values[j - k:j].astype(np.float32)
         mu  = window.mean()
         std = max(float(window.std()), mu * 0.05) + 1e-8
@@ -101,23 +101,26 @@ def evaluate_model(model, X, Y):
     with torch.no_grad():
         preds  = model(X).squeeze(-1).numpy()
     actual = Y.squeeze(-1).numpy()
-    mae     = float(np.mean(np.abs(preds - actual)))
-    rmse    = float(np.sqrt(np.mean((preds - actual) ** 2)))
-    # sign comparison in normalised space — was np.diff which compared
-    # direction between consecutive predictions (wrong)
-    dir_acc = float(np.mean(np.sign(preds) == np.sign(actual))) * 100
+    mae    = float(np.mean(np.abs(preds - actual)))
+    rmse   = float(np.sqrt(np.mean((preds - actual) ** 2)))
+    # DirAcc: does the model predict up/down vs the last window value?
+    # X[:,-1,0] is the last normalised value in the window (equivalent to "current")
+    # matches streaming eval which compares predicted > current vs actual_next > current
+    last    = X[:, -1, 0].numpy()
+    dir_acc = float(np.mean(np.sign(preds - last) == np.sign(actual - last))) * 100
     model.train()
     return mae, rmse, dir_acc
 
 
-def train_timed(model, X_tr, Y_tr, X_va, Y_va, X_te, Y_te):
+def train_timed(model, X_tr, Y_tr, X_va, Y_va):
+    # test set is never passed in — fully sealed until evaluate_stream.py
     optimizer = torch.optim.Adam(model.parameters(), lr=LR)
     # Huber loss: quadratic for |error|<1, linear beyond — less blown up by
     # large normalised targets at shape transitions (wall spikes etc.)
     # was: nn.MSELoss()
     loss_fn   = nn.HuberLoss(delta=1.0)
 
-    # checkpoints: {t_sec: (mae, rmse, dir_acc, early_stopped)}
+    # checkpoints: {t_sec: (mae, rmse, dir_acc, early_stopped)} — all val-set
     checkpoints = {}
     remaining   = list(CHECKPOINT_SECS)
     epoch       = 0
@@ -128,8 +131,8 @@ def train_timed(model, X_tr, Y_tr, X_va, Y_va, X_te, Y_te):
     best_state  = copy.deepcopy(model.state_dict())
     no_improve  = 0
     last_es_t   = t_start
-    stopped_at  = None    # wall-seconds when ES triggered
-    stopped_m   = None    # (mae, rmse, dir_acc) at best restored state
+    stopped_at  = None
+    stopped_m   = None   # val metrics at best restored state
 
     while True:
         elapsed = time.time() - t_start
@@ -140,18 +143,17 @@ def train_timed(model, X_tr, Y_tr, X_va, Y_va, X_te, Y_te):
             if stopped_at is not None:
                 checkpoints[t] = (*stopped_m, True)
                 print(f"    @{t:>3}s  [early stop @{stopped_at:.0f}s]  "
-                      f"val_MAE={best_mae:.4f}  test_MAE={stopped_m[0]:.4f}  DirAcc={stopped_m[2]:.1f}%*")
+                      f"val_MAE={stopped_m[0]:.4f}  DirAcc={stopped_m[2]:.1f}%*")
             else:
-                m_te = evaluate_model(model, X_te, Y_te)
                 m_va = evaluate_model(model, X_va, Y_va)
-                checkpoints[t] = (*m_te, False)
+                checkpoints[t] = (*m_va, False)
                 print(f"    @{t:>3}s  epoch={epoch:>4}  "
-                      f"val_MAE={m_va[0]:.4f}  test_MAE={m_te[0]:.4f}  DirAcc={m_te[2]:.1f}%")
+                      f"val_MAE={m_va[0]:.4f}  DirAcc={m_va[2]:.1f}%")
 
         if elapsed >= TIME_BUDGET or stopped_at is not None:
             break
 
-        # early stopping on val set — test set never seen during training
+        # early stopping on val set
         if time.time() - last_es_t >= ES_INTERVAL:
             last_es_t = time.time()
             current_mae = evaluate_model(model, X_va, Y_va)[0]
@@ -164,14 +166,13 @@ def train_timed(model, X_tr, Y_tr, X_va, Y_va, X_te, Y_te):
                 if no_improve >= ES_PATIENCE:
                     model.load_state_dict(best_state)
                     stopped_at = time.time() - t_start
-                    stopped_m  = evaluate_model(model, X_te, Y_te)
+                    stopped_m  = evaluate_model(model, X_va, Y_va)
                     print(f"    early stop at {stopped_at:.1f}s  "
                           f"(best val_MAE={best_mae:.4f})")
-                    # fill all remaining checkpoints immediately
                     for t in remaining:
                         checkpoints[t] = (*stopped_m, True)
                         print(f"    @{t:>3}s  [early stop @{stopped_at:.0f}s]  "
-                              f"val_MAE={best_mae:.4f}  test_MAE={stopped_m[0]:.4f}  DirAcc={stopped_m[2]:.1f}%*")
+                              f"val_MAE={stopped_m[0]:.4f}  DirAcc={stopped_m[2]:.1f}%*")
                     remaining.clear()
                     break
 
@@ -197,8 +198,10 @@ def main():
     np.random.seed(42)
 
     print(f"Building dataset: {N_SERIES} series × 300 steps, K={K} ...")
-    (X_tr, Y_tr), (X_va, Y_va), (X_te, Y_te) = build_dataset(N_SERIES, K)
-    print(f"Train: {len(X_tr):,}  |  Val: {len(X_va):,}  |  Test: {len(X_te):,}")
+    (X_tr, Y_tr), (X_va, Y_va), _ = build_dataset(N_SERIES, K)
+    # test split is built (to reserve correct seeds) but never used here —
+    # test evaluation happens exclusively in evaluate_stream.py
+    print(f"Train: {len(X_tr):,}  |  Val: {len(X_va):,}")
     print(f"Budget: {TIME_BUDGET}s/model  |  ES patience: {ES_PATIENCE}×{ES_INTERVAL}s\n")
 
     all_checkpoints = {}   # {name: {t: (mae, rmse, dir_acc, early_stopped)}}
@@ -224,7 +227,7 @@ def main():
     for name, ModelClass in MODELS.items():
         print(f"{'─'*52}\n  {name.upper()}")
         model = ModelClass()
-        checkpoints, epochs_done = train_timed(model, X_tr, Y_tr, X_va, Y_va, X_te, Y_te)
+        checkpoints, epochs_done = train_timed(model, X_tr, Y_tr, X_va, Y_va)
         all_checkpoints[name] = checkpoints
 
         save_path = MODEL_DIR / f"{name}_predictor.pt"
@@ -240,6 +243,7 @@ def main():
     print(f"\n{'='*(12 + col * len(secs))}")
     print(f"{'Model':<12}" +
           "".join(f"@{s}s".center(col) for s in secs))
+    print("  (val_MAE/val_DirAcc — test reserved for evaluate_stream.py)")
     print(f"{'─'*(12 + col * len(secs))}")
 
     for name in MODELS:

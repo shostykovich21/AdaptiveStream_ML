@@ -116,23 +116,28 @@ class MLPPredictor(nn.Module):
 
 class AttnPredictor(nn.Module):
     """
-    Lite self-attention over the 30-step window.
-    No positional encoding — order is captured implicitly through learned Q/K/V.
-    Ablation: tests whether global dependencies across the window matter.
+    Lite self-attention over the 30-step window with learned positional embeddings.
+    Without positional encoding, self-attention is permutation-invariant in interior
+    tokens — verified empirically that permuting interior tokens leaves output unchanged.
+    Positional embedding fixes this and makes the model properly order-aware.
+    Ablation: tests whether attended global context helps beyond TCN's local receptive field.
     """
     def __init__(self, seq_len=30, d_model=32, n_heads=4, dropout=0.2):
         super().__init__()
         self.input_proj = nn.Linear(1, d_model)
+        self.pos_emb    = nn.Embedding(seq_len, d_model)
         self.attn = nn.MultiheadAttention(d_model, n_heads,
                                           dropout=dropout, batch_first=True)
         self.norm = nn.LayerNorm(d_model)
         self.fc   = nn.Linear(d_model, 1)
 
     def forward(self, x):
-        h = self.input_proj(x)           # [B, seq, d_model]
+        B, T, _ = x.shape
+        pos = torch.arange(T, device=x.device).unsqueeze(0)  # [1, T]
+        h = self.input_proj(x) + self.pos_emb(pos)           # [B, T, d_model]
         attn_out, _ = self.attn(h, h, h)
-        h = self.norm(h + attn_out)      # residual + norm
-        return self.fc(h[:, -1, :])      # last timestep → [B, 1]
+        h = self.norm(h + attn_out)
+        return self.fc(h[:, -1, :])                           # last timestep → [B, 1]
 
 
 class TiDEPredictor(nn.Module):
