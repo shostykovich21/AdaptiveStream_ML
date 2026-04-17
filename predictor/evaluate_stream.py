@@ -8,9 +8,15 @@ Simulates production inference exactly:
 
 Sources
 -------
-  1. Synthetic hold-out   — seeds 162-191 (train.py held out series 120-149)
+  1. Synthetic hold-out   — seeds 170-191 (train.py test split)
   2. Wikipedia pageviews  — hourly rates, 4 articles with known burst events
   3. GitHub Archive       — per-minute event counts (--github, downloads ~5 MB/hr)
+
+Entries in evaluation table
+----------------------------
+  Neural (9):    lstm, gru, tcn, dlinear, mlp, attn, tide, fits, nbeats
+  Baselines (2): sma, ema  (no training, operate in raw rate space)
+  Ensembles (4): ens_mean, ens_wtd, ens_rnn, ens_diverse
 
 Usage
 -----
@@ -39,6 +45,7 @@ MODEL_DIR = Path(__file__).parent.parent / "models"
 # held-out series: train.py base_seed=42, 70/15/15 split
 # train: indices 0-104 (seeds 42-146), val: 105-127 (seeds 147-169), test: 128-149 (seeds 170-191)
 HOLDOUT_SEEDS = range(170, 192)
+VAL_SEEDS     = range(147, 170)   # used for EMA alpha tuning and ensemble weighting
 
 WIKI_ARTICLES = [
     ("2022_FIFA_World_Cup",  "20221101", "20221231", "World Cup matches + final"),
@@ -56,6 +63,51 @@ GH_SLOTS = [
     ("2024-03-25", 14),
 ]
 GH_URL = "https://data.gharchive.org/{date}-{hour}.json.gz"
+
+
+# ── Parametric baselines (no training, raw-space predictions) ─────────────────
+
+class SMAPredictor:
+    """Predicts the mean of the last K values — equivalent to simple moving average."""
+    is_baseline = True
+
+    def predict_raw(self, raw_window):
+        return float(np.mean(raw_window))
+
+
+class EMAPredictor:
+    """Exponential moving average. Alpha tuned on val split before evaluation."""
+    is_baseline = True
+
+    def __init__(self, alpha=0.3):
+        self.alpha = alpha
+
+    def predict_raw(self, raw_window):
+        ema = raw_window[0]
+        for v in raw_window[1:]:
+            ema = self.alpha * v + (1 - self.alpha) * ema
+        return float(ema)
+
+
+# ── Ensemble wrappers (computed on-the-fly, no .pt file needed) ───────────────
+
+class EnsemblePredictor:
+    """Weighted average of a subset of neural model predictions."""
+
+    def __init__(self, models, weights=None):
+        self.models  = models   # dict name → model
+        self.weights = weights  # dict name → float (normalised), or None for equal
+
+    def __call__(self, x):
+        preds, ws = [], []
+        for name, model in self.models.items():
+            with torch.no_grad():
+                preds.append(model(x))
+            ws.append(1.0 if self.weights is None else self.weights.get(name, 1.0))
+        stacked = torch.stack(preds, dim=0)                  # [n, B, 1]
+        w = torch.tensor(ws, dtype=torch.float32).view(-1, 1, 1)
+        w = w / w.sum()
+        return (stacked * w).sum(0)                          # [B, 1]
 
 
 # ── Model loading ─────────────────────────────────────────────────────────────
@@ -77,12 +129,104 @@ def load_models(only=None):
     return loaded
 
 
+# ── Val-split utilities for EMA tuning and ensemble weighting ─────────────────
+
+def tune_ema_alpha(alphas=(0.1, 0.2, 0.3, 0.5, 0.7)):
+    """Grid-search EMA alpha on val split. Returns the best alpha."""
+    best_alpha, best_mae = 0.3, float("inf")
+    for alpha in alphas:
+        errors = []
+        for seed in VAL_SEEDS:
+            values, _ = generate_series(n=300, baseline=100, noise_std=10, seed=seed)
+            window = deque(maxlen=K)
+            for t in range(len(values) - 1):
+                window.append(float(values[t]))
+                if len(window) < K:
+                    continue
+                raw = list(window)
+                ema = raw[0]
+                for v in raw[1:]:
+                    ema = alpha * v + (1 - alpha) * ema
+                errors.append(abs(ema - float(values[t + 1])))
+        mae = float(np.mean(errors))
+        if mae < best_mae:
+            best_mae, best_alpha = mae, alpha
+    return best_alpha
+
+
+def compute_val_maes(neural_models):
+    """
+    Run each neural model through the val split and return per-model MAE.
+    Used to compute weights for ens_wtd and to pick the best RNN for ens_diverse.
+    """
+    errors = {n: [] for n in neural_models}
+    for seed in VAL_SEEDS:
+        values, _ = generate_series(n=300, baseline=100, noise_std=10, seed=seed)
+        window = deque(maxlen=K)
+        for t in range(len(values) - 1):
+            window.append(float(values[t]))
+            if len(window) < K:
+                continue
+            h   = np.array(window, dtype=np.float32)
+            mu  = h.mean()
+            std = max(float(h.std()), mu * 0.05) + 1e-8
+            x   = torch.FloatTensor((h - mu) / std).unsqueeze(0).unsqueeze(-1)
+            for name, model in neural_models.items():
+                with torch.no_grad():
+                    pred = max(model(x).item() * std + mu, 0.0)
+                errors[name].append(abs(pred - float(values[t + 1])))
+    return {n: float(np.mean(v)) for n, v in errors.items()}
+
+
+def build_extended_models(neural_models, val_maes, ema_alpha):
+    """
+    Returns the full evaluation dict:
+      neural models + sma + ema + 4 ensemble variants.
+    Baselines and ensembles are appended after neural models.
+    """
+    extended = dict(neural_models)
+
+    # parametric baselines
+    extended["sma"] = SMAPredictor()
+    extended["ema"] = EMAPredictor(alpha=ema_alpha)
+
+    # ens_mean: equal-weight average of all available neural models
+    extended["ens_mean"] = EnsemblePredictor(neural_models)
+
+    # ens_wtd: weighted by 1/val_MAE (better models get more weight)
+    inv   = {n: 1.0 / val_maes[n] for n in neural_models if n in val_maes}
+    total = sum(inv.values())
+    extended["ens_wtd"] = EnsemblePredictor(
+        neural_models, {n: w / total for n, w in inv.items()}
+    )
+
+    # ens_rnn: lstm + gru only (recurrent family)
+    rnn = {n: neural_models[n] for n in ("lstm", "gru") if n in neural_models}
+    if len(rnn) >= 2:
+        extended["ens_rnn"] = EnsemblePredictor(rnn)
+
+    # ens_diverse: one from each family — best RNN + tcn + dlinear + attn
+    best_rnn = min(
+        [n for n in ("lstm", "gru") if n in neural_models],
+        key=lambda n: val_maes.get(n, float("inf")),
+        default=None,
+    )
+    diverse_names = [best_rnn, "tcn", "dlinear", "attn"]
+    diverse = {n: neural_models[n] for n in diverse_names
+               if n is not None and n in neural_models}
+    if len(diverse) >= 2:
+        extended["ens_diverse"] = EnsemblePredictor(diverse)
+
+    return extended
+
+
 # ── Evaluator ─────────────────────────────────────────────────────────────────
 
 class StreamingEvaluator:
     """
     Shared sliding window across all models — every model sees the same
     normalised history at each timestep.
+    Baseline models (is_baseline=True) receive the raw window instead.
     """
 
     def __init__(self, models, k=K):
@@ -107,16 +251,20 @@ class StreamingEvaluator:
         mu  = h.mean()
         std = max(float(h.std()), mu * 0.05) + 1e-8
         x   = torch.FloatTensor((h - mu) / std).unsqueeze(0).unsqueeze(-1)
+        raw = list(self.window)
         preds = {}
         for name, model in self.models.items():
-            with torch.no_grad():
-                preds[name] = max(model(x).item() * std + mu, 0.0)
+            if getattr(model, "is_baseline", False):
+                preds[name] = max(model.predict_raw(raw), 0.0)
+            else:
+                with torch.no_grad():
+                    preds[name] = max(model(x).item() * std + mu, 0.0)
         return preds
 
     def record(self, preds, actual_next, shape="unknown"):
         if preds is None:
             return
-        current = list(self.window)[-1]
+        current    = list(self.window)[-1]
         dir_actual = 1 if actual_next > current else -1
         for name, predicted in preds.items():
             self._abs_errors[name].append(abs(predicted - actual_next))
@@ -140,30 +288,37 @@ class StreamingEvaluator:
 
     def print_results(self, label=""):
         names   = list(self.models.keys())
-        all_mae = {n: float(np.mean(self._abs_errors[n])) for n in names}
-        best    = min(all_mae, key=all_mae.get)
+        all_mae = {
+            n: float(np.mean(self._abs_errors[n])) if self._abs_errors[n] else float("inf")
+            for n in names
+        }
+        best = min(all_mae, key=all_mae.get)
 
         if label:
             print(f"\n  [{label}]")
-        print(f"  {'Model':<12} {'MAE':>8} {'RMSE':>8} {'DirAcc':>9} {'n':>8}")
-        print(f"  {'─'*48}")
+        print(f"  {'Model':<14} {'MAE':>8} {'RMSE':>8} {'DirAcc':>9} {'n':>8}")
+        print(f"  {'─'*52}")
         for n in sorted(names, key=lambda x: all_mae[x]):
             errs = np.array(self._abs_errors[n])
-            rmse = float(np.sqrt(np.mean(errs ** 2)))
-            dacc = float(np.mean(self._dir_correct[n])) * 100
+            rmse = float(np.sqrt(np.mean(errs ** 2))) if len(errs) else 0.0
+            dacc = float(np.mean(self._dir_correct[n])) * 100 if self._dir_correct[n] else 0.0
             star = " ★" if n == best else ""
-            print(f"  {n:<12} {all_mae[n]:>8.2f} {rmse:>8.2f}"
+            print(f"  {n:<14} {all_mae[n]:>8.2f} {rmse:>8.2f}"
                   f" {dacc:>8.1f}% {len(errs):>8,}{star}")
 
-        all_shapes = sorted({s for n in names for s in self._shape_errs[n]})
-        if all_shapes:
+        # per-shape breakdown — only for the top 6 neural models (keeps table width manageable)
+        neural_names = [n for n in sorted(names, key=lambda x: all_mae[x])
+                        if not getattr(self.models[n], "is_baseline", False)
+                        and not isinstance(self.models[n], EnsemblePredictor)][:6]
+        all_shapes = sorted({s for n in neural_names for s in self._shape_errs[n]})
+        if all_shapes and neural_names:
             col = 10
-            print(f"\n  Per-shape MAE:")
-            print(f"  {'Shape':<14}" + "".join(f"{n:>{col}}" for n in names))
-            print(f"  {'─'*(14 + col * len(names))}")
+            print(f"\n  Per-shape MAE (top-6 neural):")
+            print(f"  {'Shape':<14}" + "".join(f"{n:>{col}}" for n in neural_names))
+            print(f"  {'─'*(14 + col * len(neural_names))}")
             for shape in all_shapes:
                 row = f"  {shape:<14}"
-                for n in names:
+                for n in neural_names:
                     errs = self._shape_errs[n].get(shape, [])
                     row += f"{np.mean(errs):>{col}.2f}" if errs else f"{'—':>{col}}"
                 print(row)
@@ -248,7 +403,7 @@ def fetch_gh_hour(date, hour):
 # ── Per-source runner ─────────────────────────────────────────────────────────
 
 def eval_source(models, streams, label, print_every=200):
-    ev = StreamingEvaluator(models)
+    ev    = StreamingEvaluator(models)
     total = 0
     for stream in streams:
         ev.reset()
@@ -269,16 +424,31 @@ def eval_source(models, streams, label, print_every=200):
 
 def main(github=False, only=None):
     print("Loading models...")
-    models = load_models(only)
-    if not models:
+    neural_models = load_models(only)
+    if not neural_models:
         print("No models found. Run train.py first.")
         return
+
+    # tune EMA and compute val MAEs for ensemble weighting
+    print("\nTuning EMA alpha on val split...")
+    ema_alpha = tune_ema_alpha()
+    print(f"  best alpha = {ema_alpha}")
+
+    print("Computing val MAEs for ensemble weights...")
+    val_maes = compute_val_maes(neural_models)
+    for n, mae in sorted(val_maes.items(), key=lambda x: x[1]):
+        print(f"  {n:<12} val_MAE={mae:.4f}")
+
+    # build full model dict: neural + baselines + ensembles
+    models = build_extended_models(neural_models, val_maes, ema_alpha)
+    print(f"\n  {len(neural_models)} neural  +  2 baselines  +  "
+          f"{len(models) - len(neural_models) - 2} ensembles  =  {len(models)} total entries\n")
 
     results = {}
 
     # ── 1. Synthetic hold-out ─────────────────────────────────────────────────
-    print(f"\n{'─'*55}")
-    print("  Synthetic hold-out  (seeds 162–191, not seen during training)")
+    print(f"{'─'*60}")
+    print("  Synthetic hold-out  (seeds 170–191, not seen during training)")
     streams, shape_maps = [], []
     for seed in HOLDOUT_SEEDS:
         values, labels = generate_series(n=300, baseline=100, noise_std=10, seed=seed)
@@ -286,7 +456,7 @@ def main(github=False, only=None):
         shape_maps.append(shape_at_each_step(labels, len(values)))
 
     ev_syn = StreamingEvaluator(models)
-    total = 0
+    total  = 0
     for values, shapes in zip(streams, shape_maps):
         ev_syn.reset()
         for t in range(len(values) - 1):
@@ -295,10 +465,10 @@ def main(github=False, only=None):
             total += 1
     print(f"  {len(streams)} series  {total:,} steps")
     ev_syn.print_results()
-    results["synthetic hold-out"] = ev_syn
+    results["synthetic"] = ev_syn
 
     # ── 2. Wikipedia pageviews ────────────────────────────────────────────────
-    print(f"\n{'─'*55}")
+    print(f"\n{'─'*60}")
     print("  Wikipedia hourly pageviews")
     wiki_streams = []
     for article, start, end, note in WIKI_ARTICLES:
@@ -319,7 +489,7 @@ def main(github=False, only=None):
 
     # ── 3. GitHub Archive (opt-in) ────────────────────────────────────────────
     if github:
-        print(f"\n{'─'*55}")
+        print(f"\n{'─'*60}")
         print("  GitHub Archive  (per-minute event counts)")
         gh_minutes = []
         for date, hour in GH_SLOTS:
@@ -331,28 +501,39 @@ def main(github=False, only=None):
             ev_gh, total = eval_source(models, [arr], "github")
             print(f"  {total:,} steps")
             ev_gh.print_results()
-            results["github archive"] = ev_gh
+            results["github"] = ev_gh
         else:
             print("  Not enough data.")
 
-    # ── Aggregate ─────────────────────────────────────────────────────────────
+    # ── Aggregate table (models × sources) ───────────────────────────────────
     if len(results) > 1:
-        print(f"\n{'='*65}")
-        print("  AGGREGATE  (MAE per source)")
-        print(f"  {'source':<24}" + "".join(f"{n:>12}" for n in models))
-        print(f"  {'─'*60}")
-        for src, ev in results.items():
-            row = f"  {src:<24}"
-            for n in models:
-                mae = float(np.mean(ev._abs_errors[n])) if ev._abs_errors[n] else float("inf")
-                row += f"{mae:>12.2f}"
-            print(row)
-        print(f"  {'─'*60}")
-        print(f"  {'pooled':<24}", end="")
+        sources = list(results.keys())
+        col     = 14
+        print(f"\n{'='*70}")
+        print("  AGGREGATE  (MAE — rows=models, cols=sources)")
+        print(f"  {'Model':<14}" +
+              "".join(f"{s[:col-2]:>{col}}" for s in sources) +
+              f"{'pooled':>{col}}")
+        print(f"  {'─'*( 14 + col * (len(sources) + 1))}")
+
+        pooled_all = {}
         for n in models:
-            all_errs = [e for ev in results.values() for e in ev._abs_errors[n]]
-            print(f"{float(np.mean(all_errs)):>12.2f}", end="")
-        print(f"\n{'='*65}\n")
+            row = f"  {n:<14}"
+            all_errs = []
+            for src, ev in results.items():
+                errs = ev._abs_errors[n]
+                mae  = float(np.mean(errs)) if errs else float("inf")
+                row += f"{mae:>{col}.2f}"
+                all_errs.extend(errs)
+            pooled = float(np.mean(all_errs)) if all_errs else float("inf")
+            pooled_all[n] = pooled
+            row += f"{pooled:>{col}.2f}"
+            print(row)
+
+        print(f"  {'─'*(14 + col * (len(sources) + 1))}")
+        best = min(pooled_all, key=pooled_all.get)
+        print(f"  best: {best}  (pooled MAE={pooled_all[best]:.2f})")
+        print(f"{'='*70}\n")
 
 
 if __name__ == "__main__":
