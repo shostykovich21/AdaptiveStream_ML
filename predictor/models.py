@@ -40,19 +40,23 @@ class GRUPredictor(nn.Module):
 
 class TCNPredictor(nn.Module):
     """
-    Temporal Convolutional Network with dilated convolutions.
-    Fully parallel (no sequential hidden state) — trains faster than RNNs.
-    Dilations [1, 2, 4, 8] give receptive field of ~30 steps, covering the full window.
+    Temporal Convolutional Network with causal dilated convolutions.
+    Causal (left-only) padding ensures output[t] depends only on input[0..t],
+    so the last output has full access to the entire 30-step window.
+    With kernel_size=3 and dilations [1,2,4,8]: RF = 1+2+4+8+16 = 31 ≥ 30. ✓
+
+    Symmetric padding (the previous approach) gave a receptive field of only
+    ~16 steps at the last position because right-side zeros displaced left-side reach.
     """
     def __init__(self, seq_len=30, channels=32, kernel_size=3, dropout=0.2):
         super().__init__()
         layers = []
         in_ch = 1
         for dilation in [1, 2, 4, 8]:
-            padding = dilation * (kernel_size - 1) // 2  # keeps sequence length constant
+            left_pad = dilation * (kernel_size - 1)   # causal: pad left only
             layers += [
-                nn.Conv1d(in_ch, channels, kernel_size,
-                          dilation=dilation, padding=padding),
+                nn.ConstantPad1d((left_pad, 0), 0),
+                nn.Conv1d(in_ch, channels, kernel_size, dilation=dilation, padding=0),
                 nn.ReLU(),
                 nn.Dropout(dropout),
             ]

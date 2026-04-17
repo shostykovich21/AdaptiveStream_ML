@@ -8,14 +8,11 @@ import torch
 import torch.nn as nn
 import numpy as np
 import time
-from pathlib import Path
 
 from models import MODELS
 from data import generate_series
+from config import K, MODEL_DIR, N_SERIES, BASE_SEED, TRAIN_RATIO, VAL_RATIO
 
-MODEL_DIR  = Path(__file__).parent.parent / "models"
-K          = 30
-N_SERIES   = 150
 BATCH_SIZE = 256
 LR         = 0.001
 
@@ -64,7 +61,8 @@ def windows_from_series(values, k):
     return X, Y
 
 
-def build_dataset(n_series, k, base_seed=42, train_ratio=0.7, val_ratio=0.15):
+def build_dataset(n_series=N_SERIES, k=K, base_seed=BASE_SEED,
+                  train_ratio=TRAIN_RATIO, val_ratio=VAL_RATIO):
     # three-way series-level split: 70% train / 15% val / 15% test
     # val used for early stopping only — test never touched during training
     # was: 80/20 train/test with early stopping on test set (leakage)
@@ -198,7 +196,7 @@ def main():
     np.random.seed(42)
 
     print(f"Building dataset: {N_SERIES} series × 300 steps, K={K} ...")
-    (X_tr, Y_tr), (X_va, Y_va), _ = build_dataset(N_SERIES, K)
+    (X_tr, Y_tr), (X_va, Y_va), _ = build_dataset()
     # test split is built (to reserve correct seeds) but never used here —
     # test evaluation happens exclusively in evaluate_stream.py
     print(f"Train: {len(X_tr):,}  |  Val: {len(X_va):,}")

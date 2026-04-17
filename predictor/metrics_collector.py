@@ -18,14 +18,16 @@ from collections import deque
 class SparkMetricsCollector:
     """Collects inputRowsPerSecond from Spark's REST API."""
 
-    def __init__(self, spark_ui_url="http://localhost:4040", window_size=30, poll_interval=1.0):
+    def __init__(self, spark_ui_url="http://localhost:4040", window_size=30,
+                 poll_interval=1.0, app_name=None):
         self.spark_ui_url = spark_ui_url.rstrip("/")
-        self.window_size = window_size
+        self.window_size  = window_size
         self.poll_interval = poll_interval
-        self.rates = deque(maxlen=window_size)
-        self._lock = threading.Lock()
-        self._running = False
-        self._thread = None
+        self.app_name     = app_name   # if set, only attach to this Spark app name
+        self.rates        = deque(maxlen=window_size)
+        self._lock        = threading.Lock()
+        self._running     = False
+        self._thread      = None
 
     def start(self):
         self._running = True
@@ -47,7 +49,11 @@ class SparkMetricsCollector:
                 if app_id is None:
                     apps = requests.get(f"{self.spark_ui_url}/api/v1/applications", timeout=2).json()
                     if apps:
-                        app_id = apps[0]["id"]
+                        if self.app_name:
+                            matched = [a for a in apps if a.get("name") == self.app_name]
+                            app_id = matched[0]["id"] if matched else None
+                        else:
+                            app_id = apps[0]["id"]
 
                 if app_id:
                     # Get streaming query progress
@@ -67,8 +73,7 @@ class SparkMetricsCollector:
                                 if bid is None or bid <= max_batch_id:
                                     continue
                                 new_max = max(new_max, bid)
-                                if rate > 0:
-                                    self._add_rate(rate)
+                                self._add_rate(rate)  # record 0.0 — idle is a real observation
                             max_batch_id = new_max
                     else:
                         # Spark 3.x: try individual query endpoints.
@@ -85,9 +90,7 @@ class SparkMetricsCollector:
                                 if run_id is None or batch_id is None or key in seen_batch_keys:
                                     continue
                                 seen_batch_keys.add(key)
-                                rate = q.get("inputRowsPerSecond", 0)
-                                if rate > 0:
-                                    self._add_rate(rate)
+                                self._add_rate(q.get("inputRowsPerSecond", 0))  # record 0.0 too
 
             except requests.exceptions.ConnectionError:
                 pass  # Spark UI not up yet, keep trying

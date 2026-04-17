@@ -1,52 +1,62 @@
 """
-AdaptiveStream LSTM Predictor Server.
+AdaptiveStream Predictor Server.
 Communicates with Java Controller via TCP.
 Collects real Spark streaming rates via REST API.
+
+Usage
+-----
+    python predictor_server.py                   # default: lstm
+    python predictor_server.py --model tcn
+    python predictor_server.py --model ens_wtd   # after adding ensemble support
+    python predictor_server.py --model lstm --port 9876 --spark-app MyApp
 """
 
+import argparse
 import socket
 import time
 import numpy as np
 import torch
-from pathlib import Path
-from models import LSTMPredictor
-from metrics_collector import SparkMetricsCollector, DriverSideCollector
+from models import MODELS
+from metrics_collector import SparkMetricsCollector
+from config import K, MODEL_DIR
 
 
 def estimate_confidence(model, history_tensor, n_passes=10):
     """
     MC Dropout confidence estimation.
-    Model has dropout layers — run multiple forward passes in train mode,
-    measure variance. High variance = low confidence.
+    Run multiple forward passes in train mode (enables dropout), measure variance.
+    High variance = low confidence. Returns 1.0 for models without dropout layers.
     """
-    model.train()  # enables dropout
+    model.train()
     preds = []
     for _ in range(n_passes):
         with torch.no_grad():
-            p = model(history_tensor).item()
-            preds.append(p)
+            preds.append(model(history_tensor).item())
     model.eval()
-
     std = np.std(preds)
-    # Confidence inversely proportional to prediction spread
-    # Normalized so baseline noise gives ~0.8-0.9 confidence
-    confidence = 1.0 / (1.0 + std * 10)
-    return float(np.clip(confidence, 0.0, 1.0))
+    return float(np.clip(1.0 / (1.0 + std * 10), 0.0, 1.0))
 
 
 def main():
-    HOST = "127.0.0.1"
-    PORT = 9876
-    K = 30
+    parser = argparse.ArgumentParser(description="AdaptiveStream predictor server")
+    parser.add_argument("--model", default="lstm", choices=list(MODELS.keys()),
+                        help=f"model architecture to serve (default: lstm)")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=9876)
+    parser.add_argument("--spark-url", default="http://localhost:4040",
+                        help="Spark UI base URL")
+    parser.add_argument("--spark-app", default=None,
+                        help="Spark app name to attach to (default: first available)")
+    args = parser.parse_args()
 
-    # Load model
-    model = LSTMPredictor()
-    model_path = Path(__file__).parent.parent / "models" / "lstm_predictor.pt"
+    # Load model from registry — no longer hardwired to LSTM
+    model = MODELS[args.model]()
+    model_path = MODEL_DIR / f"{args.model}_predictor.pt"
     try:
         model.load_state_dict(torch.load(model_path, map_location="cpu", weights_only=True))
-        print(f"[Predictor] Loaded model from {model_path}")
+        print(f"[Predictor] Loaded {args.model} from {model_path}")
     except Exception as e:
-        print(f"[Predictor] FATAL: could not load model from {model_path}: {e}")
+        print(f"[Predictor] FATAL: could not load {args.model} from {model_path}: {e}")
         print("[Predictor] Refusing to serve with uninitialised weights — exiting.")
         raise SystemExit(1)
     model.eval()
@@ -56,23 +66,26 @@ def main():
     for _ in range(10):
         with torch.no_grad():
             model(dummy)
-    print("[Predictor] Model warmed up (10 dummy inferences)")
+    print(f"[Predictor] {args.model} warmed up (10 dummy inferences)")
 
-    # Start metrics collector (polls Spark REST API)
+    # Start metrics collector
     collector = SparkMetricsCollector(
-        spark_ui_url="http://localhost:4040",
+        spark_ui_url=args.spark_url,
         window_size=K,
-        poll_interval=1.0
+        poll_interval=1.0,
+        app_name=args.spark_app,
     )
     collector.start()
-    print("[Predictor] Metrics collector started (polling Spark :4040)")
+    print(f"[Predictor] Metrics collector started (polling {args.spark_url})")
+    if args.spark_app:
+        print(f"[Predictor] Attached to Spark app: {args.spark_app}")
 
     # TCP server
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind((HOST, PORT))
+    server.bind((args.host, args.port))
     server.listen(1)
-    print(f"[Predictor] Listening on {HOST}:{PORT}")
+    print(f"[Predictor] Listening on {args.host}:{args.port}")
 
     conn, addr = server.accept()
     print(f"[Predictor] Controller connected from {addr}")
@@ -87,27 +100,32 @@ def main():
                 history = collector.get_history()
 
                 if len(history) < K:
-                    response = f"predicted_rate:100.0,confidence:0.0"
+                    # window not full yet — return partial mean rather than
+                    # a hardcoded synthetic baseline (100.0 was only valid for
+                    # the synthetic training distribution, not real workloads)
+                    fallback = float(np.mean(history)) if history else 0.0
+                    response = f"predicted_rate:{fallback:.2f},confidence:0.0"
                 else:
-                    h = np.array(history, dtype=np.float32)
+                    h   = np.array(history, dtype=np.float32)
                     mu  = h.mean()
                     std = max(float(h.std()), mu * 0.05) + 1e-8
-                    normed = (h - mu) / std
+                    x   = torch.FloatTensor((h - mu) / std).unsqueeze(0).unsqueeze(-1)
 
-                    x = torch.FloatTensor(normed).unsqueeze(0).unsqueeze(-1)
                     with torch.no_grad():
                         pred_normed = model(x).item()
 
-                    predicted_rate = max(pred_normed * std + mu, 0)
-                    confidence = estimate_confidence(model, x)
-
-                    response = f"predicted_rate:{predicted_rate:.2f},confidence:{confidence:.4f}"
+                    predicted_rate = max(pred_normed * std + mu, 0.0)
+                    confidence     = estimate_confidence(model, x)
+                    response       = f"predicted_rate:{predicted_rate:.2f},confidence:{confidence:.4f}"
 
                 conn.send((response + "\n").encode())
 
             elif data == "health":
                 ready = "ready" if collector.is_ready() else "warming_up"
-                conn.send(f"ok,status:{ready},history_len:{len(collector.get_history())}\n".encode())
+                conn.send(
+                    f"ok,model:{args.model},status:{ready},"
+                    f"history_len:{len(collector.get_history())}\n".encode()
+                )
 
             elif data.startswith("rate:"):
                 # Manual rate injection (testing)
@@ -121,6 +139,7 @@ def main():
         collector.stop()
         conn.close()
         server.close()
+
 
 if __name__ == "__main__":
     main()

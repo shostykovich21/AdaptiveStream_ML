@@ -38,15 +38,7 @@ from pathlib import Path
 
 from models import MODELS
 from data import generate_series, shape_at_each_step
-
-K         = 30
-MODEL_DIR = Path(__file__).parent.parent / "models"
-
-# held-out series: train.py base_seed=42, 70/15/15 split
-# n_train=105, n_val=int(150*0.15)=22, n_test=23
-# train: indices 0-104 (seeds 42-146), val: 105-126 (seeds 147-168), test: 127-149 (seeds 169-191)
-HOLDOUT_SEEDS = range(169, 192)
-VAL_SEEDS     = range(147, 169)   # used for EMA alpha tuning and ensemble weighting
+from config import K, MODEL_DIR, VAL_SEEDS, HOLDOUT_SEEDS
 
 WIKI_ARTICLES = [
     ("2022_FIFA_World_Cup",  "20221101", "20221231", "World Cup matches + final"),
