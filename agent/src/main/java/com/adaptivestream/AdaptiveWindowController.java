@@ -2,6 +2,9 @@ package com.adaptivestream;
 
 import java.io.*;
 import java.net.Socket;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -20,6 +23,13 @@ public class AdaptiveWindowController {
     private static final int MAX_RECONNECT_ATTEMPTS = 5;
     private static final long TARGET_EVENTS_PER_WINDOW = 1000;
 
+    // Configurable via system properties — set with -Dadaptivestream.predictor.model=tcn etc.
+    private static final String PREDICTOR_MODEL =
+        System.getProperty("adaptivestream.predictor.model", "lstm");
+    private static final String PYTHON_EXEC =
+        System.getProperty("adaptivestream.python", "python3");
+    private static final String PREDICTOR_SCRIPT = detectPredictorScript();
+
     private static Process predictorProcess;
     private static Thread controllerThread;
 
@@ -34,7 +44,8 @@ public class AdaptiveWindowController {
     public static void start() {
         controllerThread = new Thread(new Runnable() {
             public void run() {
-                System.out.println("[Controller] Starting LSTM predictor subprocess...");
+                System.out.println("[Controller] Starting predictor subprocess ("
+                    + PREDICTOR_MODEL + ") ...");
                 try {
                     startPredictor();
                     Thread.sleep(3000);
@@ -148,9 +159,39 @@ public class AdaptiveWindowController {
         fallbackMode.set(true);
     }
 
+    /**
+     * Locate predictor_server.py portably.
+     * Priority: system property > relative to agent JAR > relative to working dir > env var.
+     */
+    private static String detectPredictorScript() {
+        String prop = System.getProperty("adaptivestream.predictor.script");
+        if (prop != null) return prop;
+
+        // JAR lives in agent/target/ — go up two levels to project root, then into predictor/
+        try {
+            String jarPath = AdaptiveWindowController.class
+                .getProtectionDomain().getCodeSource().getLocation().toURI().getPath();
+            Path script = Paths.get(jarPath).getParent().getParent().getParent()
+                .resolve("predictor/predictor_server.py").normalize();
+            if (Files.exists(script)) return script.toAbsolutePath().toString();
+        } catch (Exception ignored) {}
+
+        // Working directory fallback
+        Path wdScript = Paths.get("predictor/predictor_server.py");
+        if (Files.exists(wdScript)) return wdScript.toAbsolutePath().toString();
+
+        // Environment variable fallback
+        String env = System.getenv("ADAPTIVESTREAM_PREDICTOR");
+        if (env != null) return env;
+
+        return "predictor/predictor_server.py";
+    }
+
     private static void startPredictor() throws IOException {
+        System.out.println("[Controller] Script: " + PREDICTOR_SCRIPT);
+        System.out.println("[Controller] Model:  " + PREDICTOR_MODEL);
         ProcessBuilder pb = new ProcessBuilder(
-            "python3", "/home/aayushvbarhate/adaptivestream/predictor/predictor_server.py");
+            PYTHON_EXEC, PREDICTOR_SCRIPT, "--model", PREDICTOR_MODEL);
         pb.redirectErrorStream(true);
         predictorProcess = pb.start();
 

@@ -123,8 +123,7 @@ def main():
             elif data == "health":
                 ready = "ready" if collector.is_ready() else "warming_up"
                 conn.send(
-                    f"ok,model:{args.model},status:{ready},"
-                    f"history_len:{len(collector.get_history())}\n".encode()
+                    f"ok,status:{ready},history_len:{len(collector.get_history())}\n".encode()
                 )
 
             elif data.startswith("rate:"):

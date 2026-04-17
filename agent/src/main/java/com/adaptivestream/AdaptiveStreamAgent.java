@@ -9,7 +9,7 @@ public class AdaptiveStreamAgent {
     public static void premain(String args, Instrumentation inst) {
         System.out.println("[AdaptiveStream] Agent v1.0 loading...");
 
-        // Start controller (manages LSTM subprocess + interval updates)
+        // Start controller (manages predictor subprocess + interval updates)
         AdaptiveWindowController.start();
 
         // Instrument Spark's trigger interval
