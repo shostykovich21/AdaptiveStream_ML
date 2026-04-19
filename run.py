@@ -6,17 +6,18 @@ Automates the full pipeline:
   Step 2: evaluate_stream.py  — synthetic holdout evaluation
   Step 3: evaluate_stream2.py — real Spark job evaluation
 
-Each step's output is logged to logs/run_{timestamp}/ and streamed
-to the console. Any step failure stops the pipeline and prints
-a clear diagnostic message.
+Each step's output is logged to logs/run_{timestamp}/ (or the iteration
+folder if --iteration is supplied) and streamed to the console.
+Any step failure stops the pipeline and prints a clear diagnostic message.
 
 Usage:
-  python run.py                        # full pipeline
-  python run.py --skip-train           # skip training (models already exist)
-  python run.py --skip-eval1           # skip synthetic eval
-  python run.py --skip-eval2           # skip real Spark eval
-  python run.py --eval2-duration 300   # longer real eval (300s)
-  python run.py --skip-train --skip-eval1   # only real eval
+  python run.py                           # full pipeline
+  python run.py --skip-train              # skip training (models already exist)
+  python run.py --skip-eval1              # skip synthetic eval
+  python run.py --skip-eval2              # skip real Spark eval
+  python run.py --eval2-duration 300      # longer real eval (300s)
+  python run.py --lag                     # use Kafka-lag feature (iteration 2)
+  python run.py --iteration 2 --iteration-name kafka_lag   # store in iterations/
 """
 
 import argparse
@@ -26,8 +27,9 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-PREDICTOR_DIR = Path(__file__).parent / "predictor"
-LOG_ROOT      = Path(__file__).parent / "logs"
+PREDICTOR_DIR  = Path(__file__).parent / "predictor"
+LOG_ROOT       = Path(__file__).parent / "logs"
+ITERATIONS_DIR = Path(__file__).parent / "iterations"
 
 
 def ts():
@@ -120,11 +122,27 @@ def main():
     parser.add_argument("--eval2-mode", choices=["socket", "kafka"],
                         default="socket")
     parser.add_argument("--kafka-broker", default="localhost:9092")
-    parser.add_argument("--log-dir", default=None)
+    parser.add_argument("--log-dir", default=None,
+                        help="Override log directory (defaults to logs/run_TS or iterations/)")
+    parser.add_argument("--lag", action="store_true",
+                        help="Train and evaluate with Kafka lag as 2nd input feature")
+    parser.add_argument("--log-uniform", action="store_true",
+                        help="Use log-uniform baseline dataset (data2.py)")
+    parser.add_argument("--iteration", type=int, default=None,
+                        help="Iteration number (stores logs in iterations/iteration_N_name/)")
+    parser.add_argument("--iteration-name", default="unnamed",
+                        help="Short name for this iteration (e.g. kafka_lag)")
     args = parser.parse_args()
 
-    run_ts  = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_dir = Path(args.log_dir) if args.log_dir else LOG_ROOT / f"run_{run_ts}"
+    run_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    if args.log_dir:
+        log_dir = Path(args.log_dir)
+    elif args.iteration is not None:
+        iter_folder = f"iteration_{args.iteration}_{args.iteration_name}"
+        log_dir = ITERATIONS_DIR / iter_folder
+    else:
+        log_dir = LOG_ROOT / f"run_{run_ts}"
     log_dir.mkdir(parents=True, exist_ok=True)
 
     banner(f"AdaptiveStream ML Pipeline  —  run_{run_ts}")
@@ -133,15 +151,24 @@ def main():
     print(f"  Skip eval1    : {args.skip_eval1}")
     print(f"  Skip eval2    : {args.skip_eval2}")
     print(f"  Eval2 mode    : {args.eval2_mode}  ({args.eval2_duration}s)")
+    print(f"  Lag feature   : {args.lag}")
+    print(f"  Log-uniform   : {args.log_uniform}")
+    if args.iteration is not None:
+        print(f"  Iteration     : {args.iteration} ({args.iteration_name})")
 
-    python = sys.executable
+    python  = sys.executable
     results = {}
 
     # ── Step 1: Train ──────────────────────────────────────────────────────────
     if not args.skip_train:
+        train_cmd = [python, str(PREDICTOR_DIR / "train.py")]
+        if args.lag:
+            train_cmd.append("--lag")
+        if args.log_uniform:
+            train_cmd.append("--log-uniform")
         ok, elapsed = run_step(
             name     = "Step 1: Training (all 9 models)",
-            cmd      = [python, str(PREDICTOR_DIR / "train.py")],
+            cmd      = train_cmd,
             log_path = log_dir / "train.log",
         )
         results["train"] = (ok, elapsed)
@@ -154,9 +181,14 @@ def main():
 
     # ── Step 2: Synthetic holdout eval ────────────────────────────────────────
     if not args.skip_eval1:
+        eval1_cmd = [python, str(PREDICTOR_DIR / "evaluate_stream.py")]
+        if args.lag:
+            eval1_cmd.append("--lag")
+        if args.log_uniform:
+            eval1_cmd.append("--log-uniform")
         ok, elapsed = run_step(
             name     = "Step 2: evaluate_stream.py (synthetic holdout)",
-            cmd      = [python, str(PREDICTOR_DIR / "evaluate_stream.py")],
+            cmd      = eval1_cmd,
             log_path = log_dir / "eval_synthetic.log",
         )
         results["eval_synthetic"] = (ok, elapsed)
@@ -176,6 +208,8 @@ def main():
         ]
         if args.eval2_mode == "kafka":
             eval2_cmd += ["--kafka-broker", args.kafka_broker]
+        if args.lag:
+            eval2_cmd.append("--lag")
 
         ok, elapsed = run_step(
             name     = "Step 3: evaluate_stream2.py (real Spark job)",

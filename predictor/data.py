@@ -115,6 +115,33 @@ def generate_series(n=300, baseline=100, noise_std=10, seed=None):
     return values[:n], labels
 
 
+def generate_series_with_lag(n=300, baseline=100, noise_std=10, seed=None,
+                              capacity_ratio=1.2):
+    """
+    Generate a rate series and a simulated consumer lag alongside it.
+
+    Lag model:
+      capacity = baseline * capacity_ratio  (consumer throughput ceiling)
+      lag(0)   = 0
+      lag(t)   = max(0, lag(t-1) + rate(t) - capacity)
+
+    capacity_ratio=1.2 means consumer handles 20% above baseline; any burst
+    above that causes lag to grow. This ensures lag is non-zero during burst
+    peaks so the model can learn it as a leading indicator.
+
+    Returns:
+      values   : np.ndarray shape (n,)  — rate per second
+      lag      : np.ndarray shape (n,)  — consumer lag (accumulated events)
+      labels   : list of (start, end, shape_name) tuples
+    """
+    values, labels = generate_series(n, baseline, noise_std, seed)
+    capacity = baseline * capacity_ratio
+    lag = np.zeros(n, dtype=np.float32)
+    for t in range(1, n):
+        lag[t] = max(0.0, lag[t - 1] + float(values[t]) - capacity)
+    return values, lag, labels
+
+
 def shape_at_each_step(labels, n):
     """Convert label list → per-timestep shape array (for the evaluator)."""
     out = ["noise"] * n

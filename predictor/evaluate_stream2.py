@@ -46,7 +46,7 @@ from pyspark.sql.streaming import StreamingQueryListener
 sys.path.insert(0, str(Path(__file__).parent))
 from models import MODELS
 from config import K, MODEL_DIR, VAL_SEEDS
-from data import generate_series
+from data import generate_series, generate_series_with_lag
 
 # ── logging ───────────────────────────────────────────────────────────────────
 LOG_DIR = Path(__file__).parent.parent / "logs"
@@ -71,14 +71,21 @@ def add_file_handler(path):
 class RateCollector(StreamingQueryListener):
     """
     Captures inputRowsPerSecond from every batch progress event.
+    When simulate_lag=True, also maintains a simulated consumer lag alongside
+    the rate stream using the same capacity model as training:
+      lag[t] = max(0, lag[t-1] + rate[t] - capacity_ratio * rolling_mean(rates))
     Runs on Spark's listener thread — deque is thread-safe for append/popleft.
     """
 
-    def __init__(self, window_size=K):
+    def __init__(self, window_size=K, simulate_lag=False, capacity_ratio=1.2):
         super().__init__()
-        self._rates = deque(maxlen=window_size)
-        self._lock  = threading.Lock()
-        self._batch_count = 0
+        self._rates        = deque(maxlen=window_size)
+        self._lock         = threading.Lock()
+        self._batch_count  = 0
+        self._simulate_lag = simulate_lag
+        self._capacity_ratio = capacity_ratio
+        self._lag_val      = 0.0
+        self._lags         = deque(maxlen=window_size) if simulate_lag else None
 
     def onQueryStarted(self, event):
         log.info(f"[listener] Query started: {event.id}")
@@ -87,6 +94,11 @@ class RateCollector(StreamingQueryListener):
         rate = event.progress.inputRowsPerSecond
         with self._lock:
             self._rates.append(float(rate))
+            if self._simulate_lag:
+                capacity = (float(np.mean(self._rates)) * self._capacity_ratio
+                            if self._rates else float(rate) * self._capacity_ratio)
+                self._lag_val = max(0.0, self._lag_val + float(rate) - capacity)
+                self._lags.append(self._lag_val)
             self._batch_count += 1
         log.debug(f"[listener] batch={self._batch_count}  "
                   f"inputRowsPerSecond={rate:.1f}")
@@ -97,10 +109,16 @@ class RateCollector(StreamingQueryListener):
     def onQueryIdle(self, event):
         with self._lock:
             self._rates.append(0.0)
+            if self._simulate_lag:
+                self._lags.append(self._lag_val)
 
     def get_history(self):
         with self._lock:
             return list(self._rates)
+
+    def get_lag_history(self):
+        with self._lock:
+            return list(self._lags) if self._lags is not None else []
 
     def is_ready(self):
         with self._lock:
@@ -292,30 +310,54 @@ def tune_ema():
     return best_a
 
 
-def compute_val_maes(neural):
+def _build_tensor2(rate_window, lag_window=None):
+    """Normalise rate (and optional lag) windows into a model input tensor."""
+    h   = np.array(rate_window, dtype=np.float32)
+    mu  = h.mean()
+    std = max(float(h.std()), mu * 0.05) + 1e-8
+    norm_r = (h - mu) / std
+    if lag_window is not None and len(lag_window) == len(rate_window):
+        lag_arr = np.array(lag_window, dtype=np.float32)
+        lag_std = float(lag_arr.std())
+        norm_l  = np.zeros_like(lag_arr) if lag_std < 1e-6 \
+                  else (lag_arr - lag_arr.mean()) / (lag_std + 1e-8)
+        feat = np.stack([norm_r, norm_l], axis=-1)      # [K, 2]
+        x = torch.FloatTensor(feat).unsqueeze(0)        # [1, K, 2]
+    else:
+        x = torch.FloatTensor(norm_r).unsqueeze(0).unsqueeze(-1)  # [1, K, 1]
+    return x, mu, std
+
+
+def compute_val_maes(neural, use_lag=False):
     errs = {n: [] for n in neural}
     for seed in VAL_SEEDS:
-        vals, _ = generate_series(n=300, baseline=100, noise_std=10, seed=seed)
+        if use_lag:
+            vals, lag_vals, _ = generate_series_with_lag(
+                n=300, baseline=100, noise_std=10, seed=seed)
+            lag_win = deque(maxlen=K)
+        else:
+            vals, _ = generate_series(n=300, baseline=100, noise_std=10, seed=seed)
+            lag_win = None
         win = deque(maxlen=K)
         for t in range(len(vals) - 1):
             win.append(float(vals[t]))
+            if use_lag:
+                lag_win.append(float(lag_vals[t]))
             if len(win) < K: continue
-            h = np.array(win, dtype=np.float32)
-            mu = h.mean(); std = max(float(h.std()), mu * 0.05) + 1e-8
-            x  = torch.FloatTensor((h - mu) / std).unsqueeze(0).unsqueeze(-1)
+            x, mu, std = _build_tensor2(win, lag_win if use_lag else None)
             for n, m in neural.items():
                 with torch.no_grad():
                     errs[n].append(abs(max(m(x).item() * std + mu, 0.0) - float(vals[t + 1])))
     return {n: float(np.mean(v)) for n, v in errs.items()}
 
 
-def load_neural_models():
+def load_neural_models(input_size=1):
     neural = {}
     for name, Cls in MODELS.items():
         path = MODEL_DIR / f"{name}_predictor.pt"
         if not path.exists():
             log.warning(f"  [skip] {name} — no checkpoint"); continue
-        m = Cls()
+        m = Cls(input_size=input_size)
         m.load_state_dict(torch.load(path, map_location="cpu", weights_only=True))
         m.eval()
         neural[name] = m
@@ -323,12 +365,12 @@ def load_neural_models():
     return neural
 
 
-def build_all_models(neural):
+def build_all_models(neural, use_lag=False):
     log.info("Tuning EMA alpha on val split...")
     alpha  = tune_ema()
     log.info(f"  best EMA alpha = {alpha}")
     log.info("Computing val MAEs for ensemble weights...")
-    v_maes = compute_val_maes(neural)
+    v_maes = compute_val_maes(neural, use_lag=use_lag)
     for n, mae in sorted(v_maes.items(), key=lambda x: x[1]):
         log.info(f"  {n:<12}  val_MAE={mae:.4f}")
 
@@ -358,7 +400,7 @@ def build_all_models(neural):
 
 # ── Evaluation loop ────────────────────────────────────────────────────────────
 
-def run_evaluation(models, collector, duration, csv_path):
+def run_evaluation(models, collector, duration, csv_path, use_lag=False):
     names     = list(models.keys())
     abs_errs  = {n: [] for n in names}
     mape_errs = {n: [] for n in names}
@@ -403,10 +445,8 @@ def run_evaluation(models, collector, duration, csv_path):
         if len(history) < K:
             time.sleep(1); continue
 
-        h   = np.array(history, dtype=np.float32)
-        mu  = float(h.mean())
-        std = max(float(h.std()), mu * 0.05) + 1e-8
-        x   = torch.FloatTensor((h - mu) / std).unsqueeze(0).unsqueeze(-1)
+        lag_history = collector.get_lag_history() if use_lag else None
+        x, mu, std  = _build_tensor2(history, lag_history)
 
         preds = {}
         for name, model in models.items():
@@ -421,7 +461,7 @@ def run_evaluation(models, collector, duration, csv_path):
         new_hist = collector.get_history()
         if not new_hist: continue
         actual  = float(new_hist[-1])
-        current = float(h[-1])
+        current = float(history[-1])
         dir_act = 1 if actual > current else -1
 
         row = {"timestamp": datetime.now().isoformat(),
@@ -480,6 +520,8 @@ def main():
     parser.add_argument("--kafka-topic",  default="adaptivestream-eval2")
     parser.add_argument("--duration", type=int, default=120)
     parser.add_argument("--log-dir",  default=str(LOG_DIR))
+    parser.add_argument("--lag", action="store_true",
+                        help="Evaluate lag-aware models; simulates consumer lag from rate stream")
     args = parser.parse_args()
 
     log_dir  = Path(args.log_dir)
@@ -488,17 +530,18 @@ def main():
     csv_path = log_dir / f"eval_real_{RUN_TS}.csv"
     add_file_handler(log_path)
 
-    log.info(f"Mode={args.mode}  Duration={args.duration}s")
+    log.info(f"Mode={args.mode}  Duration={args.duration}s  lag={args.lag}")
     log.info(f"Log: {log_path}")
     log.info(f"CSV: {csv_path}")
 
     # load models
-    log.info("Loading models...")
-    neural = load_neural_models()
+    input_size = 2 if args.lag else 1
+    log.info(f"Loading models (input_size={input_size})...")
+    neural = load_neural_models(input_size=input_size)
     if not neural:
         log.error("No trained models found — run train.py first.")
         sys.exit(1)
-    models = build_all_models(neural)
+    models = build_all_models(neural, use_lag=args.lag)
     log.info(f"{len(neural)} neural + 2 baselines + ensembles = {len(models)} total")
 
     # build Spark session
@@ -516,7 +559,7 @@ def main():
     spark.sparkContext.setLogLevel("ERROR")
 
     # attach listener
-    collector = RateCollector(window_size=K)
+    collector = RateCollector(window_size=K, simulate_lag=args.lag)
     spark.streams.addListener(collector)
 
     # producer + source
@@ -551,7 +594,7 @@ def main():
     log.info("Spark streaming job started")
 
     try:
-        run_evaluation(models, collector, args.duration, csv_path)
+        run_evaluation(models, collector, args.duration, csv_path, use_lag=args.lag)
     finally:
         stop_event.set()
         producer.stop()

@@ -36,7 +36,8 @@ from collections import deque
 from pathlib import Path
 
 from models import MODELS
-from data import generate_series, shape_at_each_step
+from data import generate_series, generate_series_with_lag, shape_at_each_step
+from data2 import generate_series2, generate_series_with_lag2, shape_at_each_step2
 from config import K, MODEL_DIR, VAL_SEEDS, HOLDOUT_SEEDS
 
 
@@ -87,7 +88,7 @@ class EnsemblePredictor:
 
 # ── Model loading ─────────────────────────────────────────────────────────────
 
-def load_models(only=None):
+def load_models(only=None, input_size=1):
     loaded = {}
     for name, ModelClass in MODELS.items():
         if only and name not in only:
@@ -96,7 +97,7 @@ def load_models(only=None):
         if not path.exists():
             print(f"  [skip] {name} — no checkpoint. Run train.py first.")
             continue
-        m = ModelClass()
+        m = ModelClass(input_size=input_size)
         m.load_state_dict(torch.load(path, map_location="cpu", weights_only=True))
         m.eval()
         loaded[name] = m
@@ -129,23 +130,46 @@ def tune_ema_alpha(alphas=(0.1, 0.2, 0.3, 0.5, 0.7)):
     return best_alpha
 
 
-def compute_val_maes(neural_models):
+def _build_tensor(rate_window, lag_window=None):
+    """Build normalised input tensor from sliding window deques."""
+    h   = np.array(rate_window, dtype=np.float32)
+    mu  = h.mean()
+    std = max(float(h.std()), mu * 0.05) + 1e-8
+    norm_r = (h - mu) / std
+    if lag_window is not None:
+        lag_arr = np.array(lag_window, dtype=np.float32)
+        lag_std = float(lag_arr.std())
+        norm_l  = np.zeros_like(lag_arr) if lag_std < 1e-6 \
+                  else (lag_arr - lag_arr.mean()) / (lag_std + 1e-8)
+        feat = np.stack([norm_r, norm_l], axis=-1)      # [K, 2]
+        x = torch.FloatTensor(feat).unsqueeze(0)        # [1, K, 2]
+    else:
+        x = torch.FloatTensor(norm_r).unsqueeze(0).unsqueeze(-1)  # [1, K, 1]
+    return x, mu, std
+
+
+def compute_val_maes(neural_models, use_lag=False):
     """
     Run each neural model through the val split and return per-model MAE.
     Used to compute weights for ens_wtd and to pick the best RNN for ens_diverse.
     """
     errors = {n: [] for n in neural_models}
     for seed in VAL_SEEDS:
-        values, _ = generate_series(n=300, baseline=100, noise_std=10, seed=seed)
+        if use_lag:
+            values, lag_vals, _ = generate_series_with_lag(
+                n=300, baseline=100, noise_std=10, seed=seed)
+            lag_win = deque(maxlen=K)
+        else:
+            values, _ = generate_series(n=300, baseline=100, noise_std=10, seed=seed)
+            lag_win = None
         window = deque(maxlen=K)
         for t in range(len(values) - 1):
             window.append(float(values[t]))
+            if use_lag:
+                lag_win.append(float(lag_vals[t]))
             if len(window) < K:
                 continue
-            h   = np.array(window, dtype=np.float32)
-            mu  = h.mean()
-            std = max(float(h.std()), mu * 0.05) + 1e-8
-            x   = torch.FloatTensor((h - mu) / std).unsqueeze(0).unsqueeze(-1)
+            x, mu, std = _build_tensor(window, lag_win if use_lag else None)
             for name, model in neural_models.items():
                 with torch.no_grad():
                     pred = max(model(x).item() * std + mu, 0.0)
@@ -212,10 +236,12 @@ class StreamingEvaluator:
     Baseline models (is_baseline=True) receive the raw window instead.
     """
 
-    def __init__(self, models, k=K):
-        self.models = models
-        self.k      = k
-        self.window = deque(maxlen=k)
+    def __init__(self, models, k=K, use_lag=False):
+        self.models   = models
+        self.k        = k
+        self.use_lag  = use_lag
+        self.window   = deque(maxlen=k)
+        self.lag_win  = deque(maxlen=k) if use_lag else None
         self._abs_errors  = {n: [] for n in models}
         self._dir_correct = {n: [] for n in models}
         self._shape_errs  = {n: {} for n in models}
@@ -224,15 +250,17 @@ class StreamingEvaluator:
         # clears only the sliding window — accumulators persist across series
         # so that print_results() reflects the full source, not just the last stream
         self.window.clear()
+        if self.lag_win is not None:
+            self.lag_win.clear()
 
-    def step(self, rate):
+    def step(self, rate, lag=None):
         self.window.append(float(rate))
+        if self.use_lag and lag is not None:
+            self.lag_win.append(float(lag))
         if len(self.window) < self.k:
             return None
-        h   = np.array(self.window, dtype=np.float32)
-        mu  = h.mean()
-        std = max(float(h.std()), mu * 0.05) + 1e-8
-        x   = torch.FloatTensor((h - mu) / std).unsqueeze(0).unsqueeze(-1)
+        x, mu, std = _build_tensor(
+            self.window, self.lag_win if self.use_lag else None)
         raw = list(self.window)
         preds = {}
         for name, model in self.models.items():
@@ -308,9 +336,12 @@ class StreamingEvaluator:
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-def main(only=None):
-    print("Loading models...")
-    neural_models = load_models(only)
+def main(only=None, use_lag=False, log_uniform=False):
+    input_size = 2 if use_lag else 1
+    features   = "rate+lag" if use_lag else "rate only"
+    dataset    = "log-uniform (data2)" if log_uniform else "fixed-baseline (data)"
+    print(f"Loading models  (features: {features}, dataset: {dataset}) ...")
+    neural_models = load_models(only, input_size=input_size)
     if not neural_models:
         print("No models found. Run train.py first.")
         return
@@ -321,7 +352,7 @@ def main(only=None):
     print(f"  best alpha = {ema_alpha}")
 
     print("Computing val MAEs for ensemble weights...")
-    val_maes = compute_val_maes(neural_models)
+    val_maes = compute_val_maes(neural_models, use_lag=use_lag)
     for n, mae in sorted(val_maes.items(), key=lambda x: x[1]):
         print(f"  {n:<12} val_MAE={mae:.4f}")
 
@@ -334,18 +365,34 @@ def main(only=None):
     # ── Synthetic hold-out ────────────────────────────────────────────────────
     print(f"{'─'*60}")
     print("  Synthetic hold-out  (seeds 169–191, not seen during training)")
-    streams, shape_maps = [], []
+    streams, lag_streams, shape_maps = [], [], []
     for seed in HOLDOUT_SEEDS:
-        values, labels = generate_series(n=300, baseline=100, noise_std=10, seed=seed)
+        if log_uniform:
+            if use_lag:
+                values, lag_vals, _, labels = generate_series_with_lag2(n=600, seed=seed)
+                lag_streams.append(lag_vals)
+            else:
+                values, _, labels = generate_series2(n=600, seed=seed)
+                lag_streams.append(None)
+            shape_maps.append(shape_at_each_step2(labels, len(values)))
+        elif use_lag:
+            values, lag_vals, labels = generate_series_with_lag(
+                n=300, baseline=100, noise_std=10, seed=seed)
+            lag_streams.append(lag_vals)
+            shape_maps.append(shape_at_each_step(labels, len(values)))
+        else:
+            values, labels = generate_series(n=300, baseline=100, noise_std=10, seed=seed)
+            lag_streams.append(None)
+            shape_maps.append(shape_at_each_step(labels, len(values)))
         streams.append(values)
-        shape_maps.append(shape_at_each_step(labels, len(values)))
 
-    ev = StreamingEvaluator(models)
+    ev = StreamingEvaluator(models, use_lag=use_lag)
     total = 0
-    for values, shapes in zip(streams, shape_maps):
+    for values, lag_vals, shapes in zip(streams, lag_streams, shape_maps):
         ev.reset()
         for t in range(len(values) - 1):
-            preds = ev.step(values[t])
+            lag_t = lag_vals[t] if lag_vals is not None else None
+            preds = ev.step(values[t], lag=lag_t)
             # shapes[t+1]: tag by the regime the target value belongs to,
             # not the current regime — gives "error when predicting into shape X"
             ev.record(preds, actual_next=values[t + 1], shape=shapes[t + 1])
@@ -357,5 +404,10 @@ def main(only=None):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", nargs="+", default=None)
+    parser.add_argument("--lag", action="store_true",
+                        help="Evaluate lag-aware models (input_size=2)")
+    parser.add_argument("--log-uniform", action="store_true",
+                        help="Use log-uniform holdout data (data2.py)")
     args = parser.parse_args()
-    main(only=set(args.model) if args.model else None)
+    main(only=set(args.model) if args.model else None,
+         use_lag=args.lag, log_uniform=args.log_uniform)

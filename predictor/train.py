@@ -10,7 +10,8 @@ import numpy as np
 import time
 
 from models import MODELS
-from data import generate_series
+from data import generate_series, generate_series_with_lag
+from data2 import generate_series2, generate_series_with_lag2
 from config import K, MODEL_DIR, N_SERIES, BASE_SEED, TRAIN_RATIO, VAL_RATIO
 
 BATCH_SIZE = 256
@@ -52,7 +53,7 @@ ES_MIN_DELTA = 1e-4
 
 def windows_from_series(values, k):
     X, Y = [], []
-    for j in range(k, len(values)):  # was: len(values)-1, missing the last prediction step
+    for j in range(k, len(values)):
         window = values[j - k:j].astype(np.float32)
         mu  = window.mean()
         std = max(float(window.std()), mu * 0.05) + 1e-8
@@ -61,11 +62,29 @@ def windows_from_series(values, k):
     return X, Y
 
 
+def windows_from_series_with_lag(values, lag, k):
+    """Build [K, 2] windows: (normalised_rate, normalised_lag) pairs."""
+    X, Y = [], []
+    for j in range(k, len(values)):
+        rate_win = values[j - k:j].astype(np.float32)
+        lag_win  = lag[j - k:j].astype(np.float32)
+
+        mu_r  = rate_win.mean()
+        std_r = max(float(rate_win.std()), mu_r * 0.05) + 1e-8
+        norm_r = (rate_win - mu_r) / std_r
+
+        lag_std = float(lag_win.std())
+        norm_l  = np.zeros_like(lag_win) if lag_std < 1e-6 \
+                  else (lag_win - lag_win.mean()) / (lag_std + 1e-8)
+
+        X.append(np.stack([norm_r, norm_l], axis=-1))  # [K, 2]
+        Y.append((values[j] - mu_r) / std_r)
+    return X, Y
+
+
 def build_dataset(n_series=N_SERIES, k=K, base_seed=BASE_SEED,
-                  train_ratio=TRAIN_RATIO, val_ratio=VAL_RATIO):
-    # three-way series-level split: 70% train / 15% val / 15% test
-    # val used for early stopping only — test never touched during training
-    # was: 80/20 train/test with early stopping on test set (leakage)
+                  train_ratio=TRAIN_RATIO, val_ratio=VAL_RATIO,
+                  use_lag=False, log_uniform=False):
     n_train = int(n_series * train_ratio)
     n_val   = int(n_series * val_ratio)
 
@@ -74,10 +93,23 @@ def build_dataset(n_series=N_SERIES, k=K, base_seed=BASE_SEED,
     all_X_te, all_Y_te = [], []
 
     for i in range(n_series):
-        values, _ = generate_series(n=300, baseline=100, noise_std=10,
-                                    seed=base_seed + i)
-        # was: values = generate_burst_series()
-        X_s, Y_s = windows_from_series(values, k)
+        if log_uniform:
+            if use_lag:
+                values, lag, _, _ = generate_series_with_lag2(
+                    n=600, seed=base_seed + i)
+                X_s, Y_s = windows_from_series_with_lag(values, lag, k)
+            else:
+                values, _, _ = generate_series2(n=600, seed=base_seed + i)
+                X_s, Y_s = windows_from_series(values, k)
+        elif use_lag:
+            values, lag, _ = generate_series_with_lag(
+                n=300, baseline=100, noise_std=10, seed=base_seed + i)
+            X_s, Y_s = windows_from_series_with_lag(values, lag, k)
+        else:
+            values, _ = generate_series(n=300, baseline=100, noise_std=10,
+                                        seed=base_seed + i)
+            X_s, Y_s = windows_from_series(values, k)
+
         if i < n_train:
             all_X_tr.extend(X_s); all_Y_tr.extend(Y_s)
         elif i < n_train + n_val:
@@ -86,8 +118,12 @@ def build_dataset(n_series=N_SERIES, k=K, base_seed=BASE_SEED,
             all_X_te.extend(X_s); all_Y_te.extend(Y_s)
 
     def to_tensors(X, Y):
-        return (torch.FloatTensor(np.array(X)).unsqueeze(-1),
-                torch.FloatTensor(np.array(Y)).unsqueeze(-1))
+        X_arr = np.array(X)
+        X_t   = torch.FloatTensor(X_arr)
+        if X_t.dim() == 2:          # [N, K] — no lag, add feature dim
+            X_t = X_t.unsqueeze(-1)
+        # [N, K, features] — correct for both 1-feature and 2-feature cases
+        return X_t, torch.FloatTensor(np.array(Y)).unsqueeze(-1)
 
     return (to_tensors(all_X_tr, all_Y_tr),
             to_tensors(all_X_va, all_Y_va),
@@ -191,15 +227,30 @@ def train_timed(model, X_tr, Y_tr, X_va, Y_va):
 
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--lag", action="store_true",
+                        help="Add Kafka lag as a second input feature [K,2]")
+    parser.add_argument("--log-uniform", action="store_true",
+                        help="Use log-uniform baseline dataset (data2.py): "
+                             "500 series×600 steps, baseline∈[10,500k]")
+    args = parser.parse_args()
+
     MODEL_DIR.mkdir(exist_ok=True)
     torch.manual_seed(42)
     np.random.seed(42)
 
-    print(f"Building dataset: {N_SERIES} series × 300 steps, K={K} ...")
-    (X_tr, Y_tr), (X_va, Y_va), _ = build_dataset()
-    # test split is built (to reserve correct seeds) but never used here —
-    # test evaluation happens exclusively in evaluate_stream.py
-    print(f"Train: {len(X_tr):,}  |  Val: {len(X_va):,}")
+    input_size = 2 if args.lag else 1
+    features   = "rate+lag" if args.lag else "rate only"
+    n_series   = 500 if args.log_uniform else N_SERIES
+    steps      = 600 if args.log_uniform else 300
+    dataset_tag = "log-uniform" if args.log_uniform else "fixed-baseline"
+    print(f"Building dataset: {n_series} series × {steps} steps, K={K}, "
+          f"features={features}, scale={dataset_tag} ...")
+    (X_tr, Y_tr), (X_va, Y_va), _ = build_dataset(
+        n_series=n_series, use_lag=args.lag, log_uniform=args.log_uniform)
+    print(f"Train: {len(X_tr):,}  |  Val: {len(X_va):,}  |  "
+          f"input shape: {tuple(X_tr.shape[1:])}")
     print(f"Budget: {TIME_BUDGET}s/model  |  ES patience: {ES_PATIENCE}×{ES_INTERVAL}s\n")
 
     all_checkpoints = {}   # {name: {t: (mae, rmse, dir_acc, early_stopped)}}
@@ -224,7 +275,7 @@ def main():
 
     for name, ModelClass in MODELS.items():
         print(f"{'─'*52}\n  {name.upper()}")
-        model = ModelClass()
+        model = ModelClass(input_size=input_size)
         checkpoints, epochs_done = train_timed(model, X_tr, Y_tr, X_va, Y_va)
         all_checkpoints[name] = checkpoints
 
