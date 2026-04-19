@@ -2,9 +2,11 @@
 run.py — AdaptiveStream ML Pipeline Orchestrator
 
 Automates the full pipeline:
-  Step 1: train.py          — train all 9 models
-  Step 2: evaluate_stream.py  — synthetic holdout evaluation
-  Step 3: evaluate_stream2.py — real Spark job evaluation
+  Step 1: train.py              — train all 9 models
+  Step 2: evaluate_stream.py    — synthetic holdout evaluation
+  Step 3: evaluate_stream2.py   — real Spark job, random-walk traffic
+  Step 4: evaluate_stream3.py   — real Spark job, burst traffic (2 tables)
+  Step 5: evaluate_stream4.py   — trigger policy comparison (system-level)
 
 Each step's output is logged to logs/run_{timestamp}/ (or the iteration
 folder if --iteration is supplied) and streamed to the console.
@@ -15,6 +17,8 @@ Usage:
   python run.py --skip-train              # skip training (models already exist)
   python run.py --skip-eval1              # skip synthetic eval
   python run.py --skip-eval2              # skip real Spark eval
+  python run.py --skip-eval3              # skip burst-traffic eval
+  python run.py --skip-eval4              # skip trigger-policy eval
   python run.py --eval2-duration 300      # longer real eval (300s)
   python run.py --lag                     # use Kafka-lag feature (iteration 2)
   python run.py --iteration 2 --iteration-name kafka_lag   # store in iterations/
@@ -117,8 +121,14 @@ def main():
     parser.add_argument("--skip-train",  action="store_true")
     parser.add_argument("--skip-eval1",  action="store_true")
     parser.add_argument("--skip-eval2",  action="store_true")
+    parser.add_argument("--skip-eval3",  action="store_true")
+    parser.add_argument("--skip-eval4",  action="store_true")
     parser.add_argument("--eval2-duration", type=int, default=120,
                         help="Duration for real Spark evaluation in seconds")
+    parser.add_argument("--eval3-duration", type=int, default=120,
+                        help="Duration for burst-traffic eval (eval3) in seconds")
+    parser.add_argument("--eval4-duration", type=int, default=180,
+                        help="Duration for trigger-policy eval (eval4) in seconds")
     parser.add_argument("--eval2-mode", choices=["socket", "kafka"],
                         default="socket")
     parser.add_argument("--kafka-broker", default="localhost:9092")
@@ -150,7 +160,11 @@ def main():
     print(f"  Skip train    : {args.skip_train}")
     print(f"  Skip eval1    : {args.skip_eval1}")
     print(f"  Skip eval2    : {args.skip_eval2}")
+    print(f"  Skip eval3    : {args.skip_eval3}")
+    print(f"  Skip eval4    : {args.skip_eval4}")
     print(f"  Eval2 mode    : {args.eval2_mode}  ({args.eval2_duration}s)")
+    print(f"  Eval3 duration: {args.eval3_duration}s")
+    print(f"  Eval4 duration: {args.eval4_duration}s")
     print(f"  Lag feature   : {args.lag}")
     print(f"  Log-uniform   : {args.log_uniform}")
     if args.iteration is not None:
@@ -219,6 +233,44 @@ def main():
         results["eval_real"] = (ok, elapsed)
     else:
         print(f"\n  [skip] Step 3: evaluate_stream2.py (--skip-eval2)")
+
+    # ── Step 4: Burst-traffic eval (eval3) ────────────────────────────────────
+    if not args.skip_eval3:
+        eval3_cmd = [
+            python,
+            str(PREDICTOR_DIR / "evaluate_stream3.py"),
+            "--duration", str(args.eval3_duration),
+            "--log-dir",  str(log_dir),
+        ]
+        if args.lag:
+            eval3_cmd.append("--lag")
+        ok, elapsed = run_step(
+            name     = "Step 4: evaluate_stream3.py (burst traffic, 2 tables)",
+            cmd      = eval3_cmd,
+            log_path = log_dir / "eval_burst.log",
+        )
+        results["eval_burst"] = (ok, elapsed)
+    else:
+        print(f"\n  [skip] Step 4: evaluate_stream3.py (--skip-eval3)")
+
+    # ── Step 5: Trigger policy comparison (eval4) ─────────────────────────────
+    if not args.skip_eval4:
+        eval4_cmd = [
+            python,
+            str(PREDICTOR_DIR / "evaluate_stream4.py"),
+            "--duration", str(args.eval4_duration),
+            "--log-dir",  str(log_dir),
+        ]
+        if args.lag:
+            eval4_cmd.append("--lag")
+        ok, elapsed = run_step(
+            name     = "Step 5: evaluate_stream4.py (trigger policy comparison)",
+            cmd      = eval4_cmd,
+            log_path = log_dir / "eval_policy.log",
+        )
+        results["eval_policy"] = (ok, elapsed)
+    else:
+        print(f"\n  [skip] Step 5: evaluate_stream4.py (--skip-eval4)")
 
     print_summary(results)
 

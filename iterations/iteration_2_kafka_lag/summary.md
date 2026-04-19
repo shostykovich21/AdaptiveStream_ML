@@ -78,6 +78,30 @@ Lag: simulated (capacity = rolling_mean × 1.2)
 
 ---
 
+## Burst Traffic Results (evaluate_stream3.py) — Not Run
+
+> Models for iteration 2 were overwritten when iteration 3 was trained.
+> To reproduce: retrain iteration 2 (`python run.py --lag --iteration 2 --iteration-name kafka_lag --skip-eval1 --skip-eval2`), then run:
+> `python predictor/evaluate_stream3.py --lag --duration 120 --log-dir iterations/iteration_2_kafka_lag`
+
+### Table 3 — Option A: Replay · Table 4 — Option B: Live
+
+*Results not available — models not preserved.*
+
+---
+
+## Trigger Policy Results (evaluate_stream4.py) — Not Run
+
+> Same dependency: iteration 2 models were overwritten.
+> To reproduce: retrain, then run:
+> `python predictor/evaluate_stream4.py --duration 180 --log-dir iterations/iteration_2_kafka_lag`
+
+### Table 5 — Fixed vs Adaptive Trigger Policy
+
+*Results not available — models not preserved.*
+
+---
+
 ## Commands Used
 
 ```bash

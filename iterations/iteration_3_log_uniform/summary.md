@@ -81,16 +81,91 @@ Lag: simulated (capacity = rolling_mean × 1.2)
 
 ---
 
+## Burst Traffic Results (evaluate_stream3.py)
+
+evaluate_stream3.py — real Spark job, burst-shaped traffic (data2.py holdout seeds 169–191).
+Producer: min=13, max=2000, mean=393, p25=57, p75=531 events/s · 120s · 151 Spark batches
+
+### Table 3 — Option A: Replay (offline sliding-window on Spark-measured burst rates)
+
+| Model       |  MAE  |  RMSE  |  MAPE  | DirAcc |
+|-------------|-------|--------|--------|--------|
+| ema         | 179.1 |  324.9 |  84.8% | 60.0% ★ |
+| dlinear     | 200.8 |  356.3 | 110.1% | 44.2% |
+| ens_mean    | 208.3 |  347.7 | 148.2% | 53.3% |
+| ens_top3    | 209.8 |  364.4 | 124.1% | 54.2% |
+| ens_wtd     | 210.5 |  348.8 | 152.0% | 53.3% |
+| ens_rnn     | 211.7 |  370.9 | 124.8% | 51.7% |
+| lstm        | 212.7 |  389.6 | 111.8% | 52.5% |
+| ens_diverse | 213.1 |  354.3 | 154.3% | 56.7% |
+| fits        | 214.7 |  366.5 | 124.3% | 50.8% |
+| gru         | 217.8 |  364.7 | 152.8% | 55.8% |
+| attn        | 220.8 |  354.3 | 203.2% | 56.7% |
+| tcn         | 223.1 |  346.0 | 198.7% | 55.0% |
+| mlp         | 225.8 |  349.2 | 201.9% | 55.8% |
+| tide        | 235.0 |  369.4 | 173.1% | 50.0% |
+| nbeats      | 240.4 |  365.0 | 205.7% | 52.5% |
+| sma         | 253.2 |  361.8 | 322.4% | 61.7% |
+
+### Table 4 — Option B: Live (real-time inference during Spark run)
+
+| Model       |  MAE  |  RMSE  |  MAPE  | DirAcc |
+|-------------|-------|--------|--------|--------|
+| ema         | 178.6 |  324.9 |  84.5% | 55.8% ★ |
+| dlinear     | 199.4 |  356.2 | 114.0% | 45.0% |
+| ens_mean    | 207.6 |  347.7 | 151.8% | 50.0% |
+| ens_top3    | 208.5 |  364.3 | 127.5% | 51.7% |
+| ens_wtd     | 209.7 |  348.8 | 155.3% | 50.0% |
+| ens_rnn     | 210.1 |  370.8 | 128.0% | 51.7% |
+| lstm        | 210.9 |  389.5 | 115.3% | 54.2% |
+| ens_diverse | 212.7 |  354.4 | 157.4% | 52.5% |
+| fits        | 215.0 |  367.2 | 138.2% | 51.7% |
+| gru         | 216.7 |  364.6 | 154.9% | 53.3% |
+| attn        | 221.0 |  354.4 | 207.0% | 52.5% |
+| tcn         | 223.6 |  346.3 | 199.4% | 50.0% |
+| mlp         | 226.5 |  349.5 | 204.9% | 51.7% |
+| tide        | 234.7 |  369.3 | 175.9% | 45.8% |
+| nbeats      | 239.1 |  365.0 | 206.3% | 50.0% |
+| sma         | 256.6 |  363.1 | 328.5% | 56.7% |
+
+---
+
+## Trigger Policy Results (evaluate_stream4.py)
+
+Simulated on 100ms-resolution tick trace from BurstProducer · 180s · 1803 ticks
+Producer: min=13, max=2000, mean=441, p25=77, p75=618 ev/s
+Formula: `intervalMs = clamp(500 / pred_ev_s × 1000, 100, 5000)`
+
+### Table 5 — Fixed vs Adaptive Trigger Policy
+
+| Policy           | Triggers | Empty% | MeanBatch | Throughput | PeakBacklog | ClearanceT |
+|------------------|----------|--------|-----------|------------|-------------|------------|
+| fixed_100ms      |    1802  |   0.0% |      44.1 |       44.1 |         200 |      61.0s |
+| fixed_500ms      |     360  |   0.0% |     220.9 |      220.9 |         983 |      94.0s |
+| fixed_1000ms     |     180  |   0.0% |     441.8 |      441.8 |        1964 |      47.0s |
+| fixed_2000ms     |      90  |   0.0% |     883.6 |      883.6 |        2915 |          ∞ |
+| adaptive_ema     |     131  |   0.0% |     606.4 |      606.4 |        2380 |       7.0s |
+| adaptive_lstm    |     132  |   0.0% |     601.5 |      601.5 |        4248 |       1.0s ★ |
+| adaptive_ens_top3|     158  |   0.0% |     503.4 |      503.4 |        2257 |      36.0s |
+
+---
+
 ## Commands Used
 
 ```bash
 # Training + synthetic eval (via run.py)
 python run.py --lag --log-uniform --iteration 3 --iteration-name log_uniform --skip-eval2
 
-# Real Spark eval (separate run)
+# Real Spark eval (random-walk traffic)
 python run.py --lag --log-uniform --iteration 3 --iteration-name log_uniform --skip-train --skip-eval1
 # which internally runs:
 # python predictor/evaluate_stream2.py --lag --duration 120 --log-dir iterations/iteration_3_log_uniform
+
+# Burst-traffic eval (Tables 3 + 4)
+python predictor/evaluate_stream3.py --lag --duration 120 --log-dir iterations/iteration_3_log_uniform
+
+# Trigger policy comparison (Table 5)
+python predictor/evaluate_stream4.py --duration 180 --log-dir iterations/iteration_3_log_uniform
 ```
 
 ---

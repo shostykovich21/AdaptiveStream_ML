@@ -125,6 +125,30 @@ Producer: min=1, max=151, mean=19, p25=4, p75=32 events/s
 
 ---
 
+## Burst Traffic Results (evaluate_stream3.py) — Not Run
+
+> Models for iteration 1 were overwritten when iteration 3 was trained.
+> To reproduce: retrain iteration 1 (`python predictor/train.py`), then run:
+> `python predictor/evaluate_stream3.py --duration 120 --log-dir iterations/iteration_1_baseline`
+
+### Table 3 — Option A: Replay · Table 4 — Option B: Live
+
+*Results not available — models not preserved.*
+
+---
+
+## Trigger Policy Results (evaluate_stream4.py) — Not Run
+
+> Same dependency: iteration 1 models were overwritten.
+> To reproduce: retrain, then run:
+> `python predictor/evaluate_stream4.py --duration 180 --log-dir iterations/iteration_1_baseline`
+
+### Table 5 — Fixed vs Adaptive Trigger Policy
+
+*Results not available — models not preserved.*
+
+---
+
 ## Commands Used
 
 ```bash
