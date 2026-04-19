@@ -1,75 +1,21 @@
 """
-evaluate_stream2.py — Real Spark Infrastructure, Synthetic Random-Walk Traffic
-===============================================================================
+evaluate_stream2.py — Real Spark Job Evaluation
 
-WHAT THIS EVAL DOES
--------------------
 Runs a genuine Spark Structured Streaming job in-process. A StreamingQueryListener
-captures inputRowsPerSecond from every micro-batch — the exact same metric the JVM
-AdaptiveStream agent reads in production. Models predict the next batch's rate; the
-listener delivers the actual rate one second later.
+captures inputRowsPerSecond from every micro-batch — the exact metric the JVM
+AdaptiveStream agent reads in production. Models predict the next batch's rate;
+the listener delivers the actual rate one second later.
 
-The traffic source is a Poisson random-walk producer: log_rate drifts by Normal(0,0.12)
-every 100ms, events sent via socket. Rate range: 1–10,000 events/s.
-
-WHAT IS REAL vs. WHAT IS NOT
------------------------------
-  Real:   Spark Structured Streaming job (genuine micro-batches, real JVM)
-          StreamingQueryListener capturing inputRowsPerSecond (production metric)
-          TCP socket source (same path as production socket mode)
-          Inference latency is real wall-clock time
-
-  Not real: The traffic producer. It generates random-walk noise, NOT the burst
-            patterns (ramps, walls, sawteeth) that real production Kafka topics
-            exhibit. There is no diurnal cycle, no flash-sale spike, no retry storm.
-
-WHAT THE RESULTS TELL US
-------------------------
-This eval tests: "Do models handle scale-variable random-walk traffic?"
-
-It does NOT test: burst pattern recognition, which is what the models were trained for
-and what distinguishes them from EMA.
-
-For random-walk traffic, the optimal strategy is persistence — predict that the next
-value is close to the current value. EMA exploits this directly. Neural models do not
-(they look for structure that isn't there), which is why EMA dominated iter1 and iter2:
-
-  iter1: EMA MAE=6.86, LSTM MAE=8.89  — producer mean=19 ev/s, tiny random walk
-  iter2: EMA MAE=11.95, LSTM MAE=28.04 — producer mean=107 ev/s, still random walk
-
-In iter3, LSTM finally beat EMA (229 vs 271 MAE) — but NOT because burst recognition
-improved. The producer happened to reach mean=1,292 ev/s (max=10k). Iter1/2 models,
-trained only at baseline=100, were out-of-distribution at that scale and over-predicted
-hugely. Iter3 log-uniform models handle scale correctly, so their errors are smaller.
-It's a scale coverage win, not a pattern recognition win.
-
-THE HONEST LIMITATION
----------------------
-This eval validates the infrastructure pipeline correctly. It does NOT tell us whether
-training on synthetic burst shapes translates to any production benefit. A model that
-does well here mainly has good scale coverage and doesn't over-predict on random walk.
-
-EMA's consistently low MAPE (~30-48% across iterations) is the benchmark to beat on
-any traffic that lacks burst structure. Neural models only meaningfully outperform EMA
-when the traffic actually contains the burst transitions they were trained to recognise.
-
-WHAT THIS POINTS TOWARD
------------------------
-evaluate_stream3.py (next): two modes:
-  (a) Replay mode — feed a real historical inputRowsPerSecond trace (CSV) through
-      the same sliding-window evaluator. No live Spark needed. No distribution
-      assumption. This is the gold-standard eval: if a model wins here, it wins
-      on actual production traffic.
-  (b) Burst-producer mode — replace PoissonProducer with a generator that emits
-      synthetic burst shapes (from data.py/data2.py) into the live Spark job. The
-      infrastructure remains real; the traffic structure approximates production.
-      Note: this favours neural models (same shapes as training, different seeds)
-      but tests whether the pattern recognition benefit survives the real infrastructure.
+Traffic source (choose one):
+  --mode socket  [default] Poisson random-walk producer via TCP socket.
+                 Rate range 1–10,000 ev/s. No external deps.
+  --mode kafka   Reads from Kafka. Requires docker-compose up -d.
+                 --kafka-broker localhost:9092
 
 Output:
   Console: comparison table (MAE, RMSE, MAPE, DirAcc — all models + ensembles)
-  File:    logs/eval_real_{timestamp}.csv  (raw per-step predictions)
-           logs/eval_real_{timestamp}.log  (structured run log)
+  File:    logs/eval_real_{timestamp}.csv
+           logs/eval_real_{timestamp}.log
 
 Usage:
   python evaluate_stream2.py

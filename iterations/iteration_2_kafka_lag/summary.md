@@ -10,59 +10,6 @@
 
 ---
 
-## What the Two Evaluations Tell Us
-
-### evaluate_stream.py — Synthetic Holdout
-
-Same interpretation as iter1: tests whether models generalise within the synthetic
-burst distribution. The lag feature adds a second channel that reflects accumulated
-backpressure during bursts — in theory, a leading indicator of burst magnitude.
-
-**What the results show:** Small but consistent improvement. ens_top3 MAE improved
-28.49 → 27.64, LSTM improved 28.64 → 28.06. DirAcc held at ~72%. The lag feature
-helps but modestly — the rate channel already carries most of the structural signal.
-
-**Why the improvement is small:** In synthetic data, the lag is derived from the same
-rate series (it's simulated, not independently observed). The model is essentially
-getting a filtered, integrated version of the rate signal as a second channel. Real
-Kafka lag would be independently measured from broker offset tracking and would be a
-genuinely leading indicator — it starts rising before inputRowsPerSecond does.
-
-### evaluate_stream2.py — Real Spark, Random-Walk Traffic
-
-The infrastructure is real (live Spark, StreamingQueryListener). The lag here is
-also simulated — derived from the same rate stream inside the collector using the
-capacity model. It provides no independent signal.
-
-**What the results show:** EMA wins again (MAE=11.95 vs LSTM MAE=28.04). The producer
-this run generated mean=107 ev/s — still random-walk, no burst structure.
-
-**Why neural models got worse vs iter1 on this eval:** Iter1 models trained on
-baseline=100 were approximately in-distribution for 107 ev/s traffic. The lag feature
-added a second channel that gave no useful signal on random-walk data, so neural models
-had more noise to contend with without any benefit. The result looks like regression
-(iter1 LSTM=8.89, iter2 LSTM=28.04) but the two producer runs are not comparable —
-iter2's producer reached higher rates (max=1,084 vs max=151 in iter1).
-
-**The core issue remains:** This eval tests random-walk handling, not burst recognition.
-The lag feature's theoretical advantage (leading indicator of burst onset) cannot be
-demonstrated here because there are no bursts.
-
-### Why the Lag Feature Is Still Worth Having
-
-In real production, Kafka lag is measured independently — it's the difference between
-the latest broker offset and the consumer's committed offset. It starts growing before
-inputRowsPerSecond rises (because backlog accumulates before the rate metric reflects
-it). This is a genuine leading indicator that EMA cannot use. The limitation here is
-that we are simulating lag from the rate stream itself, not measuring it independently.
-
-**This points to iter3:** The more urgent fix was scale — models trained at baseline=100
-are out-of-distribution when Spark traffic is in the thousands or tens of thousands.
-Log-uniform training (iter3) addresses this and is necessary before the lag feature's
-real advantage can be measured.
-
----
-
 ## Training Summary (val_MAE, best checkpoint)
 
 | Rank | Model   | val_MAE | val_DirAcc | Converged |
@@ -131,23 +78,40 @@ Lag: simulated (capacity = rolling_mean × 1.2)
 
 ---
 
-## Key Observations
+## Commands Used
 
-1. **Lag feature gives marginal but consistent synthetic improvement** (ens_top3
-   28.49→27.64 MAE). Not a breakthrough because simulated lag is derived from the same
-   rate signal — there is no independent leading information.
+```bash
+# Training + synthetic eval (via run.py)
+python run.py --lag --iteration 2 --iteration-name kafka_lag --skip-eval2
 
-2. **Real eval: EMA wins again** (11.95 vs LSTM 28.04). Random-walk producer gives
-   neural models nothing to work with. High MAPE (>100% for strong neural models)
-   because models over-predict bursts that never come; when actual rate is very low
-   (1–5 ev/s) but prediction is high, MAPE explodes.
+# Real Spark eval (separate run)
+python run.py --lag --iteration 2 --iteration-name kafka_lag --skip-train --skip-eval1
+# which internally runs:
+# python predictor/evaluate_stream2.py --lag --duration 120 --log-dir iterations/iteration_2_kafka_lag
+```
 
-3. **Apparent regression vs iter1 on real eval is a different producer run**, not a
-   true regression. The iter2 producer reached higher rates (max=1,084 vs 151) which
-   further exposes the scale mismatch: models trained at baseline=100 produce large
-   absolute errors when the true rate is in the hundreds or thousands.
+---
 
-4. **The root cause is scale:** A model trained exclusively at 100 ev/s is
-   out-of-distribution at 1,000 ev/s. It will produce predictions near 100 while
-   actuals are near 1,000. This drives both high MAE and high MAPE. Fix: log-uniform
-   training (iter3).
+## Learnings
+
+- **Simulated lag gives marginal synthetic improvement** (ens_top3 28.49→27.64 MAE,
+  DirAcc unchanged at ~72%). The lag channel is derived from the same rate stream, so
+  it adds no independent information — it's an integrated, smoothed version of what the
+  model already sees. The improvement is real but small.
+
+- **Real Kafka lag would be different.** In production, lag = latest broker offset −
+  consumer committed offset. It starts rising before inputRowsPerSecond does, because
+  the backlog accumulates first. That's a genuine leading indicator. Simulated lag is
+  a lagging derivative of the rate, which is almost the opposite.
+
+- **The apparent regression on real eval (LSTM 8.89→28.04) is not a regression.** The
+  iter2 producer ran at max=1,084 ev/s vs max=151 in iter1 — different run entirely.
+  Models trained at baseline=100 produce predictions near 100 when actuals are 500–1,000,
+  which drives MAE linearly with traffic magnitude. MAPE exceeds 100% for the same reason:
+  when actual is low (1–5 ev/s) and the model predicts a burst that doesn't come, MAPE
+  explodes.
+
+- **Scale is the dominant problem, not the lag feature.** A model out-of-distribution
+  by 10× in scale will always lose to EMA regardless of how many features it has.
+  Log-uniform training (iter3) must come before the lag feature's real advantage can
+  be measured.

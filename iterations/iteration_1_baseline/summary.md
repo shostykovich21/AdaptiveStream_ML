@@ -125,22 +125,39 @@ Producer: min=1, max=151, mean=19, p25=4, p75=32 events/s
 
 ---
 
-## Key Observations
+## Commands Used
 
-1. **Synthetic eval confirms neural models learn burst structure.** ens_top3 (MAE=28.49,
-   DirAcc=72.4%) vs EMA (MAE=55.30, DirAcc=44.6%). The 28-point gap in DirAcc is the
-   core signal: neural models call burst direction correctly ~72% of the time; EMA calls
-   it wrong more than right.
+```bash
+# Training
+python predictor/train.py
 
-2. **Real Spark eval is dominated by EMA** (MAE=6.86) because the Poisson producer
-   generates mean=19 ev/s slow random-walk traffic — no bursts for neural models to
-   exploit. LSTM ranks last among neural models here (MAE=8.89) because it was trained
-   to predict transitions that aren't present in the traffic.
+# Synthetic holdout eval
+python predictor/evaluate_stream.py
 
-3. **The gap is a distribution mismatch, not a model failure.** Neural models are being
-   tested on a problem they weren't trained for. EMA happens to be optimal for that
-   problem (random walk → persistence is best). This doesn't mean EMA wins in production.
+# Real Spark eval
+python predictor/evaluate_stream2.py --duration 120
+```
 
-4. **Fixes applied in iterations 2 and 3:** Kafka lag as a leading indicator (iter2),
-   then log-uniform baseline to ensure scale coverage across 10–500k ev/s (iter3).
-   The real eval producer in iter3 reached mean=1,292 ev/s, and LSTM finally beat EMA.
+---
+
+## Learnings
+
+- **Neural models learn burst structure.** On synthetic holdout, ens_top3 DirAcc=72.4%
+  vs EMA DirAcc=44.6%. Neural models correctly call the direction of burst transitions
+  ~72% of the time; EMA calls it wrong more than right because it has no structural
+  knowledge — it always predicts close to the recent average, which is precisely wrong
+  at transition points (peak turning over, wall dropping, sawtooth resetting).
+
+- **DirAcc is the metric that matters, not raw MAE.** MAE is in absolute events/s and
+  scales with traffic magnitude. DirAcc is scale-invariant and directly comparable
+  across iterations. All cross-iteration comparison should use DirAcc.
+
+- **EMA wins on real Spark when traffic is random-walk** (mean=19 ev/s, no bursts).
+  Persistence — predict close to the recent value — is the optimal strategy for a
+  memoryless random walk. Neural models find no structure to exploit and lose to EMA.
+  This is not a model failure; it is a distribution mismatch.
+
+- **Fixed baseline=100 is a hard ceiling.** Models trained at one scale are
+  out-of-distribution when traffic exceeds that scale. Any producer run reaching
+  hundreds or thousands of events/s will expose this collapse. Two fixes are needed:
+  log-uniform training (iter3) and an eval that actually contains burst structure.
