@@ -356,12 +356,13 @@ def compute_val_maes(neural, use_lag=False):
     return {n: float(np.mean(v)) for n, v in errs.items()}
 
 
-def load_neural_models(input_size=1):
+def load_neural_models(input_size=1, model_dir=None):
+    model_dir = Path(model_dir) if model_dir else MODEL_DIR
     neural = {}
     for name, Cls in MODELS.items():
-        path = MODEL_DIR / f"{name}_predictor.pt"
+        path = model_dir / f"{name}_predictor.pt"
         if not path.exists():
-            log.warning(f"  [skip] {name} — no checkpoint"); continue
+            log.warning(f"  [skip] {name} — no checkpoint in {model_dir}"); continue
         m = Cls(input_size=input_size)
         m.load_state_dict(torch.load(path, map_location="cpu", weights_only=True))
         m.eval()
@@ -545,6 +546,9 @@ def main():
     parser.add_argument("--duration", type=int, default=120)
     parser.add_argument("--lag",      action="store_true")
     parser.add_argument("--log-dir",  default=str(LOG_DIR))
+    parser.add_argument("--model-dir", default=None,
+                        help="Directory containing model checkpoints "
+                             "(default: models/ at project root)")
     args = parser.parse_args()
 
     log_dir  = Path(args.log_dir)
@@ -556,7 +560,7 @@ def main():
     input_size = 2 if args.lag else 1
     log.info(f"evaluate_stream3  duration={args.duration}s  lag={args.lag}")
     log.info(f"Loading models (input_size={input_size})...")
-    neural = load_neural_models(input_size=input_size)
+    neural = load_neural_models(input_size=input_size, model_dir=args.model_dir)
     if not neural:
         log.error("No trained models found — run train.py first.")
         sys.exit(1)

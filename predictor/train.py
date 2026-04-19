@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 import time
+from pathlib import Path
 
 from models import MODELS
 from data import generate_series, generate_series_with_lag
@@ -234,9 +235,13 @@ def main():
     parser.add_argument("--log-uniform", action="store_true",
                         help="Use log-uniform baseline dataset (data2.py): "
                              "500 series×600 steps, baseline∈[10,500k]")
+    parser.add_argument("--model-dir", default=None,
+                        help="Directory to save model checkpoints "
+                             "(default: models/ at project root)")
     args = parser.parse_args()
 
-    MODEL_DIR.mkdir(exist_ok=True)
+    model_dir = Path(args.model_dir) if args.model_dir else MODEL_DIR
+    model_dir.mkdir(parents=True, exist_ok=True)
     torch.manual_seed(42)
     np.random.seed(42)
 
@@ -279,7 +284,7 @@ def main():
         checkpoints, epochs_done = train_timed(model, X_tr, Y_tr, X_va, Y_va)
         all_checkpoints[name] = checkpoints
 
-        save_path = MODEL_DIR / f"{name}_predictor.pt"
+        save_path = model_dir / f"{name}_predictor.pt"
         torch.save(model.state_dict(), save_path)
         saved_val_mae, _, saved_val_dacc = evaluate_model(model, X_va, Y_va)
         print(f"  → {save_path.name}  epochs={epochs_done}  "

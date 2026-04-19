@@ -155,8 +155,17 @@ def main():
         log_dir = LOG_ROOT / f"run_{run_ts}"
     log_dir.mkdir(parents=True, exist_ok=True)
 
+    # Per-iteration model directory: iterations/iteration_N_name/models/
+    # Falls back to project-root models/ for ad-hoc (non-iteration) runs.
+    if args.iteration is not None:
+        model_dir = log_dir / "models"
+    else:
+        model_dir = Path(__file__).parent / "models"
+    model_dir.mkdir(parents=True, exist_ok=True)
+
     banner(f"AdaptiveStream ML Pipeline  —  run_{run_ts}")
     print(f"  Log directory : {log_dir}")
+    print(f"  Model directory: {model_dir}")
     print(f"  Skip train    : {args.skip_train}")
     print(f"  Skip eval1    : {args.skip_eval1}")
     print(f"  Skip eval2    : {args.skip_eval2}")
@@ -175,7 +184,8 @@ def main():
 
     # ── Step 1: Train ──────────────────────────────────────────────────────────
     if not args.skip_train:
-        train_cmd = [python, str(PREDICTOR_DIR / "train.py")]
+        train_cmd = [python, str(PREDICTOR_DIR / "train.py"),
+                     "--model-dir", str(model_dir)]
         if args.lag:
             train_cmd.append("--lag")
         if args.log_uniform:
@@ -195,7 +205,8 @@ def main():
 
     # ── Step 2: Synthetic holdout eval ────────────────────────────────────────
     if not args.skip_eval1:
-        eval1_cmd = [python, str(PREDICTOR_DIR / "evaluate_stream.py")]
+        eval1_cmd = [python, str(PREDICTOR_DIR / "evaluate_stream.py"),
+                     "--model-dir", str(model_dir)]
         if args.lag:
             eval1_cmd.append("--lag")
         if args.log_uniform:
@@ -216,9 +227,10 @@ def main():
         eval2_cmd = [
             python,
             str(PREDICTOR_DIR / "evaluate_stream2.py"),
-            "--duration",  str(args.eval2_duration),
-            "--mode",      args.eval2_mode,
-            "--log-dir",   str(log_dir),
+            "--duration",   str(args.eval2_duration),
+            "--mode",       args.eval2_mode,
+            "--log-dir",    str(log_dir),
+            "--model-dir",  str(model_dir),
         ]
         if args.eval2_mode == "kafka":
             eval2_cmd += ["--kafka-broker", args.kafka_broker]
@@ -239,8 +251,9 @@ def main():
         eval3_cmd = [
             python,
             str(PREDICTOR_DIR / "evaluate_stream3.py"),
-            "--duration", str(args.eval3_duration),
-            "--log-dir",  str(log_dir),
+            "--duration",  str(args.eval3_duration),
+            "--log-dir",   str(log_dir),
+            "--model-dir", str(model_dir),
         ]
         if args.lag:
             eval3_cmd.append("--lag")
@@ -258,8 +271,9 @@ def main():
         eval4_cmd = [
             python,
             str(PREDICTOR_DIR / "evaluate_stream4.py"),
-            "--duration", str(args.eval4_duration),
-            "--log-dir",  str(log_dir),
+            "--duration",  str(args.eval4_duration),
+            "--log-dir",   str(log_dir),
+            "--model-dir", str(model_dir),
         ]
         if args.lag:
             eval4_cmd.append("--lag")

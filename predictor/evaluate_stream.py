@@ -82,14 +82,15 @@ class EnsemblePredictor:
 
 # ── Model loading ─────────────────────────────────────────────────────────────
 
-def load_models(only=None, input_size=1):
+def load_models(only=None, input_size=1, model_dir=None):
+    model_dir = Path(model_dir) if model_dir else MODEL_DIR
     loaded = {}
     for name, ModelClass in MODELS.items():
         if only and name not in only:
             continue
-        path = MODEL_DIR / f"{name}_predictor.pt"
+        path = model_dir / f"{name}_predictor.pt"
         if not path.exists():
-            print(f"  [skip] {name} — no checkpoint. Run train.py first.")
+            print(f"  [skip] {name} — no checkpoint in {model_dir}")
             continue
         m = ModelClass(input_size=input_size)
         m.load_state_dict(torch.load(path, map_location="cpu", weights_only=True))
@@ -330,12 +331,12 @@ class StreamingEvaluator:
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-def main(only=None, use_lag=False, log_uniform=False):
+def main(only=None, use_lag=False, log_uniform=False, model_dir=None):
     input_size = 2 if use_lag else 1
     features   = "rate+lag" if use_lag else "rate only"
     dataset    = "log-uniform (data2)" if log_uniform else "fixed-baseline (data)"
     print(f"Loading models  (features: {features}, dataset: {dataset}) ...")
-    neural_models = load_models(only, input_size=input_size)
+    neural_models = load_models(only, input_size=input_size, model_dir=model_dir)
     if not neural_models:
         print("No models found. Run train.py first.")
         return
@@ -402,6 +403,10 @@ if __name__ == "__main__":
                         help="Evaluate lag-aware models (input_size=2)")
     parser.add_argument("--log-uniform", action="store_true",
                         help="Use log-uniform holdout data (data2.py)")
+    parser.add_argument("--model-dir", default=None,
+                        help="Directory containing model checkpoints "
+                             "(default: models/ at project root)")
     args = parser.parse_args()
     main(only=set(args.model) if args.model else None,
-         use_lag=args.lag, log_uniform=args.log_uniform)
+         use_lag=args.lag, log_uniform=args.log_uniform,
+         model_dir=args.model_dir)

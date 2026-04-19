@@ -327,13 +327,14 @@ def _detect_input_size(state_dict):
     return min(candidates)
 
 
-def load_neural_models():
+def load_neural_models(model_dir=None):
+    model_dir  = Path(model_dir) if model_dir else MODEL_DIR
     neural     = {}
     input_size = None
     for name, Cls in MODELS.items():
-        path = MODEL_DIR / f"{name}_predictor.pt"
+        path = model_dir / f"{name}_predictor.pt"
         if not path.exists():
-            log.warning(f"  [skip] {name}"); continue
+            log.warning(f"  [skip] {name} — no checkpoint in {model_dir}"); continue
         sd = torch.load(path, map_location="cpu", weights_only=True)
         # try detected size, then fall back to 1 and 2
         hint = _detect_input_size(sd)
@@ -533,6 +534,9 @@ def main():
     parser.add_argument("--lag",      action="store_true",
                         help="Use lag-aware models (input_size=2)")
     parser.add_argument("--log-dir",  default=str(LOG_DIR))
+    parser.add_argument("--model-dir", default=None,
+                        help="Directory containing model checkpoints "
+                             "(default: models/ at project root)")
     args = parser.parse_args()
 
     log_dir  = Path(args.log_dir)
@@ -543,7 +547,7 @@ def main():
 
     # ── Load models ───────────────────────────────────────────────────────────
     log.info("Loading neural models (auto-detecting input_size from checkpoints)...")
-    neural, detected_input_size = load_neural_models()
+    neural, detected_input_size = load_neural_models(model_dir=args.model_dir)
     if not neural:
         log.error("No trained models found — run train.py first.")
         sys.exit(1)

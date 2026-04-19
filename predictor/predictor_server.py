@@ -47,11 +47,16 @@ def main():
                         help="Spark UI base URL")
     parser.add_argument("--spark-app", default=None,
                         help="Spark app name to attach to (default: first available)")
+    parser.add_argument("--model-dir", default=None,
+                        help="Directory containing model checkpoints "
+                             "(default: models/ at project root)")
     args = parser.parse_args()
 
+    from pathlib import Path
+    model_dir  = Path(args.model_dir) if args.model_dir else MODEL_DIR
     # Load model from registry — no longer hardwired to LSTM
     model = MODELS[args.model]()
-    model_path = MODEL_DIR / f"{args.model}_predictor.pt"
+    model_path = model_dir / f"{args.model}_predictor.pt"
     try:
         model.load_state_dict(torch.load(model_path, map_location="cpu", weights_only=True))
         print(f"[Predictor] Loaded {args.model} from {model_path}")
