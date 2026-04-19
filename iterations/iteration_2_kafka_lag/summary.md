@@ -2,11 +2,64 @@
 
 **Date:** 2026-04-19
 **Features:** rate + simulated Kafka lag [K=30, 2 features]
-**Dataset:** 150 series × 300 steps, baseline=100 (same as iter 1)
+**Dataset:** 150 series × 300 steps, fixed baseline=100
 **Models:** 9 neural + 5 ensembles + 2 baselines
 **Change from iter 1:** Added Kafka lag as 2nd input feature (input_size=2)
-  - Lag model: `lag[t] = max(0, lag[t-1] + rate[t] - capacity)`, `capacity = baseline * 1.2`
+  - Lag model: `lag[t] = max(0, lag[t-1] + rate[t] - capacity)`, `capacity = baseline × 1.2`
   - Lag normalised per-window independently of rate
+
+---
+
+## What the Two Evaluations Tell Us
+
+### evaluate_stream.py — Synthetic Holdout
+
+Same interpretation as iter1: tests whether models generalise within the synthetic
+burst distribution. The lag feature adds a second channel that reflects accumulated
+backpressure during bursts — in theory, a leading indicator of burst magnitude.
+
+**What the results show:** Small but consistent improvement. ens_top3 MAE improved
+28.49 → 27.64, LSTM improved 28.64 → 28.06. DirAcc held at ~72%. The lag feature
+helps but modestly — the rate channel already carries most of the structural signal.
+
+**Why the improvement is small:** In synthetic data, the lag is derived from the same
+rate series (it's simulated, not independently observed). The model is essentially
+getting a filtered, integrated version of the rate signal as a second channel. Real
+Kafka lag would be independently measured from broker offset tracking and would be a
+genuinely leading indicator — it starts rising before inputRowsPerSecond does.
+
+### evaluate_stream2.py — Real Spark, Random-Walk Traffic
+
+The infrastructure is real (live Spark, StreamingQueryListener). The lag here is
+also simulated — derived from the same rate stream inside the collector using the
+capacity model. It provides no independent signal.
+
+**What the results show:** EMA wins again (MAE=11.95 vs LSTM MAE=28.04). The producer
+this run generated mean=107 ev/s — still random-walk, no burst structure.
+
+**Why neural models got worse vs iter1 on this eval:** Iter1 models trained on
+baseline=100 were approximately in-distribution for 107 ev/s traffic. The lag feature
+added a second channel that gave no useful signal on random-walk data, so neural models
+had more noise to contend with without any benefit. The result looks like regression
+(iter1 LSTM=8.89, iter2 LSTM=28.04) but the two producer runs are not comparable —
+iter2's producer reached higher rates (max=1,084 vs max=151 in iter1).
+
+**The core issue remains:** This eval tests random-walk handling, not burst recognition.
+The lag feature's theoretical advantage (leading indicator of burst onset) cannot be
+demonstrated here because there are no bursts.
+
+### Why the Lag Feature Is Still Worth Having
+
+In real production, Kafka lag is measured independently — it's the difference between
+the latest broker offset and the consumer's committed offset. It starts growing before
+inputRowsPerSecond rises (because backlog accumulates before the rate metric reflects
+it). This is a genuine leading indicator that EMA cannot use. The limitation here is
+that we are simulating lag from the rate stream itself, not measuring it independently.
+
+**This points to iter3:** The more urgent fix was scale — models trained at baseline=100
+are out-of-distribution when Spark traffic is in the thousands or tens of thousands.
+Log-uniform training (iter3) addresses this and is necessary before the lag feature's
+real advantage can be measured.
 
 ---
 
@@ -54,8 +107,8 @@ Seeds 169–191 · 23 series · 6,210 steps
 ## Real Spark Job Results (evaluate_stream2.py)
 
 Socket mode · 120 steps · Random Poisson traffic
-Producer: min=1, max=1084, mean=107, p25=6, p75=126 events/s
-Lag: **simulated** (capacity = rolling_mean × 1.2)
+Producer: min=1, max=1,084, mean=107, p25=6, p75=126 events/s
+Lag: simulated (capacity = rolling_mean × 1.2)
 
 | Model       |  MAE  |  RMSE  |  MAPE  | DirAcc |
 |-------------|-------|--------|--------|--------|
@@ -78,21 +131,23 @@ Lag: **simulated** (capacity = rolling_mean × 1.2)
 
 ---
 
-## vs. Iteration 1 (rate-only baseline)
-
-| Metric | iter1 (rate only) | iter2 (rate+lag) | Δ |
-|--------|-------------------|-------------------|---|
-| Synthetic ens_top3 MAE | 28.49 | 27.64 | **-0.85** |
-| Synthetic lstm MAE | 28.64 | 28.06 | **-0.58** |
-| Real EMA MAE | 6.86 | 11.95 | +5.09 (different run) |
-
-Note: Real Spark MAE not directly comparable — different producer run each time.
-
----
-
 ## Key Observations
 
-1. **Synthetic**: Lag feature gives a small but consistent improvement. ens_top3 improves from 28.49 → 27.64 MAE.
-2. **Real Spark**: EMA still wins on random-walk Poisson traffic. The simulated lag in eval2 is derived from the same rate stream (no independent signal), so it provides no additional information to neural models.
-3. **Root cause of real-eval gap**: Poisson random-walk traffic has no burst structure — neural models trained on ramps/walls/sawteeth don't generalise. EMA exploits temporal persistence.
-4. **Fix**: Iteration 3 — log-uniform synthetic training (covers 10→500k events/s). Plus longer, more variable Spark producer.
+1. **Lag feature gives marginal but consistent synthetic improvement** (ens_top3
+   28.49→27.64 MAE). Not a breakthrough because simulated lag is derived from the same
+   rate signal — there is no independent leading information.
+
+2. **Real eval: EMA wins again** (11.95 vs LSTM 28.04). Random-walk producer gives
+   neural models nothing to work with. High MAPE (>100% for strong neural models)
+   because models over-predict bursts that never come; when actual rate is very low
+   (1–5 ev/s) but prediction is high, MAPE explodes.
+
+3. **Apparent regression vs iter1 on real eval is a different producer run**, not a
+   true regression. The iter2 producer reached higher rates (max=1,084 vs 151) which
+   further exposes the scale mismatch: models trained at baseline=100 produce large
+   absolute errors when the true rate is in the hundreds or thousands.
+
+4. **The root cause is scale:** A model trained exclusively at 100 ev/s is
+   out-of-distribution at 1,000 ev/s. It will produce predictions near 100 while
+   actuals are near 1,000. This drives both high MAE and high MAPE. Fix: log-uniform
+   training (iter3).

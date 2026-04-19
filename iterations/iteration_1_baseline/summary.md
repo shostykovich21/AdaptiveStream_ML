@@ -2,8 +2,59 @@
 
 **Date:** 2026-04-17 (training) / 2026-04-19 (real eval)
 **Features:** rate only [K=30, 1 feature]
-**Dataset:** 150 series × 300 steps, baseline=100 (fixed scale), 7 shapes
+**Dataset:** 150 series × 300 steps, fixed baseline=100, 7 shapes
 **Models:** 9 neural + 5 ensembles + 2 baselines
+
+---
+
+## What the Two Evaluations Tell Us
+
+### evaluate_stream.py — Synthetic Holdout
+
+This tests generalisation within the synthetic distribution. The holdout series
+(seeds 169–191) use the same shape vocabulary as training (ramps, walls, sawteeth,
+plateaus, cliffs, double-peaks, noise) but are entirely different random instances
+never seen during training.
+
+**What it answers:** "Can the model recognise and predict burst transitions it hasn't
+seen before, given that production traffic structurally resembles these shapes?"
+
+**What it doesn't answer:** Whether real Kafka/Spark traffic actually looks like these
+shapes. This is a closed-world test.
+
+**Why neural models win here:** EMA has no structural knowledge — it predicts "close to
+recent average." On burst transitions (e.g. a ramp peaking and turning over), EMA
+consistently calls direction wrong. Neural models correctly anticipate the transition.
+DirAcc of 72.4% (ens_top3) vs 44.6% (EMA) is real signal, not artefact.
+
+### evaluate_stream2.py — Real Spark, Random-Walk Traffic
+
+This runs a genuine Spark Structured Streaming job and captures real
+inputRowsPerSecond via StreamingQueryListener. The infrastructure is real.
+The traffic is not: a Poisson random-walk generator produced mean=19 ev/s,
+fluctuating slowly with no burst structure.
+
+**What it answers:** "Which model handles slow random-walk traffic at low rate?"
+
+**What it doesn't answer:** Whether burst pattern recognition matters in production.
+Random-walk traffic has no burst structure, so models trained to recognise bursts
+find no signal to exploit. EMA wins because persistence (predict ≈ recent value)
+is the optimal strategy for any memoryless random walk.
+
+**Why EMA wins here (and what it means):** EMA MAE=6.86 vs LSTM MAE=8.89. This is
+not evidence that EMA is better than LSTM in production — it's evidence that the
+producer generated traffic with no structure for neural models to leverage.
+The models are not being tested on the problem they were trained for.
+
+**The gap between these two evals is the core problem of this project.** Eval 1 shows
+neural models clearly outperform EMA on burst traffic. Eval 2 shows EMA beats neural
+models on random-walk traffic. Real production Kafka topics have both regimes. A fair
+evaluation needs real traffic — or at least burst-structured synthetic traffic fed
+into a live Spark job.
+
+**This points to evaluate_stream3.py:** either replay a real inputRowsPerSecond trace
+(gold standard, no distribution assumptions) or feed burst-shaped traffic into the
+live Spark job (tests whether the pattern recognition benefit survives real infrastructure).
 
 ---
 
@@ -76,7 +127,20 @@ Producer: min=1, max=151, mean=19, p25=4, p75=32 events/s
 
 ## Key Observations
 
-1. **Synthetic**: Neural models win clearly. ens_top3 best (MAE=28.49), EMA worst (MAE=55.30).
-2. **Real Spark**: EMA wins (MAE=6.86). Neural models lose because traffic was near-constant (mean=19 events/s, p75=32). No real bursts to differentiate models.
-3. **Gap**: The real Spark producer generated slow random walk traffic, not burst patterns. Neural models were trained on burst shapes. EMA exploits persistence — it wins on any slow-moving signal.
-4. **Fix**: Kafka lag feature should give neural models a leading indicator that EMA doesn't have. Log-uniform training broadens the distribution.
+1. **Synthetic eval confirms neural models learn burst structure.** ens_top3 (MAE=28.49,
+   DirAcc=72.4%) vs EMA (MAE=55.30, DirAcc=44.6%). The 28-point gap in DirAcc is the
+   core signal: neural models call burst direction correctly ~72% of the time; EMA calls
+   it wrong more than right.
+
+2. **Real Spark eval is dominated by EMA** (MAE=6.86) because the Poisson producer
+   generates mean=19 ev/s slow random-walk traffic — no bursts for neural models to
+   exploit. LSTM ranks last among neural models here (MAE=8.89) because it was trained
+   to predict transitions that aren't present in the traffic.
+
+3. **The gap is a distribution mismatch, not a model failure.** Neural models are being
+   tested on a problem they weren't trained for. EMA happens to be optimal for that
+   problem (random walk → persistence is best). This doesn't mean EMA wins in production.
+
+4. **Fixes applied in iterations 2 and 3:** Kafka lag as a leading indicator (iter2),
+   then log-uniform baseline to ensure scale coverage across 10–500k ev/s (iter3).
+   The real eval producer in iter3 reached mean=1,292 ev/s, and LSTM finally beat EMA.

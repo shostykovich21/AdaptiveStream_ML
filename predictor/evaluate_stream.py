@@ -1,20 +1,62 @@
 """
-Streaming evaluator — tests trained models against held-out synthetic data.
+evaluate_stream.py — Synthetic Holdout Evaluation
+==================================================
 
-Simulates production inference exactly:
-  - K=30 sliding window deque (mirrors metrics_collector.py)
-  - Per-window normalisation at each step (mirrors predictor_server.py)
-  - One observation at a time, no look-ahead
+WHAT THIS EVAL DOES
+-------------------
+Replays held-out synthetic series (seeds 169–191, never seen during training)
+through the exact same inference path used in production:
+  - K=30 sliding window deque  (mirrors metrics_collector.py)
+  - Per-window normalisation at each step  (mirrors predictor_server.py)
+  - One observation at a time, strictly no look-ahead
 
-Sources
--------
-  1. Synthetic hold-out — seeds 169-191 (train.py test split, never touched during training)
+Each model gets the same normalised window at each timestep and predicts
+the next inputRowsPerSecond. Error is measured in raw events/s.
 
-  Note: Wikipedia and GitHub Archive sources were tested but removed. The models are
-  trained on synthetic burst shapes at ~100 events/s scale; real-world data (Wikipedia
-  daily views in the hundreds of thousands) is out-of-distribution and produces
-  meaningless absolute MAE comparisons. Real-data evaluation will be re-added once
-  the synthetic dataset is extended to cover slower-timescale and variable-scale regimes.
+WHAT THE RESULTS TELL US
+------------------------
+This is a closed-world generalisation test. It answers:
+
+  "Can a model, having learned from synthetic burst shapes, correctly predict
+   the next step of a burst shape it has never seen before?"
+
+It does NOT answer whether real production Spark traffic looks like these shapes.
+
+The gap between neural DirAcc (72–77%) and EMA DirAcc (39–44% in iter3) is real
+and meaningful: neural models learn the abstract structure of bursts (ramp-up,
+plateau, cliff) well enough to correctly call the direction of the next step ~77%
+of the time. EMA cannot — it has no structural knowledge, so it calls direction
+wrong more than right when traffic is actively transitioning through a burst shape.
+
+WHY DirAcc IS THE RIGHT CROSS-ITERATION METRIC
+-----------------------------------------------
+MAE is in raw events/s and scales with baseline. Iter 3 holdout baselines reach
+500k events/s, so raw MAE of 6,696 (iter3) vs 28 (iter2) is not a regression —
+it just reflects the scale change. DirAcc is scale-invariant: it only asks
+"did the model correctly predict up or down?" and is directly comparable across
+all three iterations.
+
+LIMITATIONS (why this alone is insufficient)
+--------------------------------------------
+1. Closed-world: holdout is from the same distribution as training (same shapes,
+   different random seeds). We cannot infer from this that real production traffic
+   follows these shapes.
+
+2. Favourable to neural models: EMA never trained on burst shapes, but burst shapes
+   are exactly what this test uses. EMA's structural weakness is directly exposed.
+   This is fair to the task (if production has bursts, EMA is genuinely limited),
+   but it is not a balanced comparison if production traffic is random-walk.
+
+3. No real Spark infrastructure: inference is simulated, not measured live. Latency,
+   JVM integration, and TCP round-trip are not accounted for.
+
+WHAT THIS POINTS TOWARD
+-----------------------
+A third evaluation (evaluate_stream3.py) is needed that either:
+  (a) replays a real inputRowsPerSecond trace from a production Spark cluster — no
+      assumptions about distribution, the only truly unbiased test; or
+  (b) feeds synthetic burst-shaped traffic into a live Spark job so the infrastructure
+      is real and the traffic structure reflects production burst behaviour.
 
 Entries in evaluation table
 ----------------------------
@@ -25,6 +67,8 @@ Entries in evaluation table
 Usage
 -----
     python evaluate_stream.py
+    python evaluate_stream.py --lag
+    python evaluate_stream.py --lag --log-uniform
     python evaluate_stream.py --model lstm tcn
 """
 
